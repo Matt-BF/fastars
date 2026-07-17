@@ -5,3 +5,4 @@ edition = "2024"
 
 [dependencies]
 regex = "1.13.0"
+zstd = { version = "0.13.3", default-features = false, features = ["pkg-config"] }

@@ -44,12 +44,13 @@ fn usage() -> &'static str {
     r#"fastars — fast random retrieval from BGZF-compressed FASTA files
 
 USAGE:
-    fastars --fasta <FASTA.bgz> [OPTIONS] [ID ...]
+    fastars fetch --fasta <FASTA.bgz> [OPTIONS] [ID ...]
     fastars index --fasta <FASTA.bgz> [OPTIONS]
     fastars index --fai <FASTA.bgz.fai> --gzi <FASTA.bgz.gzi> [OPTIONS]
 
 COMMANDS:
-    index    Build a self-contained .ffx index.
+    fetch    Fetch FASTA records by exact ID, prefix, or regular expression.
+    index    Build a compressed, self-contained .ffx index.
 
 FETCH OPTIONS:
     --fasta <FILE>             BGZF-compressed FASTA to read. Required.
@@ -79,7 +80,7 @@ regular-expression queries.
 }
 
 fn index_usage() -> &'static str {
-    r#"fastars index — build a self-contained lookup index
+    r#"fastars index — build a compressed, self-contained lookup index
 
 USAGE:
     fastars index --fasta <FASTA.bgz> [OPTIONS]
@@ -135,7 +136,7 @@ fn parse_fetch_args() -> Result<FetchArgs, String> {
     let mut invert_match = false;
     let mut temp_directory = None;
     let mut ids = Vec::new();
-    let mut arguments = env::args().skip(1);
+    let mut arguments = env::args().skip(2);
 
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
@@ -354,15 +355,15 @@ fn run_fetch_command() -> Result<(), Box<dyn Error>> {
         write_record(&mut reader, &mut output, record)?;
     }
 
-    if !arguments.sort_by_offset {
-        if let Some(regex) = &regex {
-            index.for_each_regex(regex, arguments.invert_match, |record| {
-                if seen.insert(record.record_id) {
-                    write_record(&mut reader, &mut output, &record)?;
-                }
-                Ok(())
-            })?;
-        }
+    if !arguments.sort_by_offset
+        && let Some(regex) = &regex
+    {
+        index.for_each_regex(regex, arguments.invert_match, |record| {
+            if seen.insert(record.record_id) {
+                write_record(&mut reader, &mut output, &record)?;
+            }
+            Ok(())
+        })?;
     }
 
     Ok(())
@@ -370,15 +371,22 @@ fn run_fetch_command() -> Result<(), Box<dyn Error>> {
 
 fn main() {
     let first_argument = env::args().nth(1);
-    if matches!(first_argument.as_deref(), Some("-h" | "--help")) {
+    let second_argument = env::args().nth(2);
+    if matches!(first_argument.as_deref(), Some("-h" | "--help"))
+        || (first_argument.as_deref() == Some("fetch")
+            && matches!(second_argument.as_deref(), Some("-h" | "--help")))
+    {
         println!("{}", usage());
         return;
     }
 
-    let result = if first_argument.as_deref() == Some("index") {
-        run_index_command()
-    } else {
-        run_fetch_command()
+    let result = match first_argument.as_deref() {
+        Some("fetch") => run_fetch_command(),
+        Some("index") => run_index_command(),
+        Some(command) => {
+            Err(io::Error::other(format!("Unknown command: {command}\n\n{}", usage())).into())
+        }
+        None => Err(io::Error::other(format!("A command is required\n\n{}", usage())).into()),
     };
 
     if let Err(error) = result {

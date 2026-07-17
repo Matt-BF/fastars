@@ -1,12 +1,15 @@
 # fastars
 
 `fastars` fetches records from large BGZF-compressed FASTA files using a
-self-contained `.ffx` index. It writes FASTA (nucleotide and protein) records to standard output, so it
-fits directly into shell pipelines.
+self-contained `.ffx` index. It writes FASTA (nucleotide and protein) records
+to standard output, so it fits directly into shell pipelines.
+
+Use `fastars index` to build an index and `fastars fetch` to retrieve records.
 
 ## Requirements
 
 - Rust and Cargo to build the program.
+- The system zstd library and `pkg-config` to build compressed index support.
 - A BGZF-compressed FASTA (`.bgz`), not plain gzip or zstd compression.
 - The system `sort` command to build an `.ffx` index.
 
@@ -40,7 +43,8 @@ sequences.fna.bgz.ffx
 ```
 
 If existing samtools indexes are available, they can be used as a build
-accelerator but are not required (and can be deleted after creating the `.ffx` file:
+accelerator but are not required and can be deleted after creating the `.ffx`
+file:
 
 ```bash
 fastars index \
@@ -49,8 +53,10 @@ fastars index \
   --output sequences.fna.bgz.ffx
 ```
 
-The resulting `.ffx` is the same kind of self-contained fetch index. It stores
-full IDs, BGZF virtual offsets, sequence lengths, and FASTA line layout.
+The resulting `.ffx` is a compressed, self-contained fetch index. It stores
+full IDs, BGZF virtual offsets, sequence lengths, and FASTA line layout in
+independently compressed blocks for fast lookup without loading the complete
+index.
 
 After building the index, use `--id-mode prefix` to fetch IDs by literal prefix
 or `--id-regexp` to select indexed IDs with a regular expression. Examples for
@@ -61,7 +67,7 @@ both modes are below.
 Exact full-ID lookup is the default:
 
 ```bash
-fastars --fasta sequences.fna.bgz \
+fastars fetch --fasta sequences.fna.bgz \
   'IMGVR_UViG_2582581227_000001|2582581227|2582690522' > selected.fna
 ```
 
@@ -73,7 +79,7 @@ the FASTA before fetching.
 Use prefix mode when your query is the beginning of the indexed full ID:
 
 ```bash
-fastars --fasta sequences.fna.bgz \
+fastars fetch --fasta sequences.fna.bgz \
   --id-mode prefix IMGVR_UViG_2582581227_000001 > selected.fna
 ```
 
@@ -90,7 +96,7 @@ the query `IMGVR_UViG_2582581227_000001` matches because it is a literal prefix.
 Use `-f` or `--ids-file` for one query per line:
 
 ```bash
-fastars --fasta sequences.fna.bgz \
+fastars fetch --fasta sequences.fna.bgz \
   --id-mode prefix \
   -f short_ids.txt > selected.fna
 ```
@@ -104,14 +110,14 @@ With `--id-mode exact`, each line must be a full exact ID. With
 `--id-regexp` scans the indexed full IDs, not the FASTA sequence text:
 
 ```bash
-fastars --fasta sequences.fna.bgz \
+fastars fetch --fasta sequences.fna.bgz \
   --id-regexp 'GVMAG' > gvmag_records.fna
 ```
 
 Invert the regex to fetch everything whose full ID does not match:
 
 ```bash
-fastars --fasta sequences.fna.bgz \
+fastars fetch --fasta sequences.fna.bgz \
   --id-regexp 'GVMAG' \
   -v > non_gvmag_records.fna
 ```
@@ -130,7 +136,7 @@ follow sorted ID order. Use `--sort-by-offset` to fetch in FASTA order, which
 can reduce random disk access for many records. `-s` is its short form:
 
 ```bash
-fastars --fasta sequences.fna.bgz \
+fastars fetch --fasta sequences.fna.bgz \
   --id-mode prefix \
   -f short_ids.txt \
   --sort-by-offset > selected.fna
@@ -139,6 +145,6 @@ fastars --fasta sequences.fna.bgz \
 ## Notes
 
 - `.ffx` is a generated artifact. Rebuild it after changing the FASTA or
-  upgrading from an older `fastars` index format.
+  upgrading from an older `fastars` index format. Older uncompressed indexes
+  are not compatible with the current format.
 - Plain `.gz` and `.zst` FASTA files are not supported for random retrieval.
-- The `.ffx` file generated is still very large. Next versions will try to improve this
