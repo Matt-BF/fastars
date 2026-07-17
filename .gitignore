@@ -2,3 +2,4 @@
 *.ffx
 *.tmp
 *.unsorted
+*/docs/ai/*
