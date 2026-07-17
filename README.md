@@ -1,7 +1,7 @@
 # fastars
 
 `fastars` fetches records from large BGZF-compressed FASTA files using a
-self-contained `.ffx` index. It writes FASTA records to standard output, so it
+self-contained `.ffx` index. It writes FASTA (nucleotide and protein) records to standard output, so it
 fits directly into shell pipelines.
 
 ## Requirements
@@ -40,7 +40,7 @@ sequences.fna.bgz.ffx
 ```
 
 If existing samtools indexes are available, they can be used as a build
-accelerator:
+accelerator but are not required (and can be deleted after creating the `.ffx` file:
 
 ```bash
 fastars index \
@@ -55,14 +55,6 @@ full IDs, BGZF virtual offsets, sequence lengths, and FASTA line layout.
 After building the index, use `--id-mode prefix` to fetch IDs by literal prefix
 or `--id-regexp` to select indexed IDs with a regular expression. Examples for
 both modes are below.
-
-Useful build options:
-
-```bash
-fastars index --fasta sequences.fna.bgz \
-  --output custom.ffx \
-  --temp-directory /scratch/tmp
-```
 
 ## Fetch by exact full ID
 
@@ -92,7 +84,6 @@ IMGVR_UViG_2582581227_000001|2582581227|2582690522
 ```
 
 the query `IMGVR_UViG_2582581227_000001` matches because it is a literal prefix.
-This is global and does not assume `|` separators.
 
 ## Fetch from an ID file
 
@@ -145,6 +136,5 @@ fastars --fasta sequences.fna.bgz \
 
 - `.ffx` is a generated artifact. Rebuild it after changing the FASTA or
   upgrading from an older `fastars` index format.
-- Fetching needs only the BGZF FASTA and `.ffx`; `.fai` and `.gzi` are not
-  read during fetch.
 - Plain `.gz` and `.zst` FASTA files are not supported for random retrieval.
+- The `.ffx` file generated is still very large. Next versions will try to improve this
