@@ -52,6 +52,10 @@ fastars index \
 The resulting `.ffx` is the same kind of self-contained fetch index. It stores
 full IDs, BGZF virtual offsets, sequence lengths, and FASTA line layout.
 
+After building the index, use `--id-mode prefix` to fetch IDs by literal prefix
+or `--id-regexp` to select indexed IDs with a regular expression. Examples for
+both modes are below.
+
 Useful build options:
 
 ```bash

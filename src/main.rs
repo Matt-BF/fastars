@@ -73,7 +73,8 @@ INDEX OPTIONS:
 
 The .ffx stores full IDs, BGZF virtual offsets, sequence lengths, and line
 layout. Fetching needs only the BGZF FASTA and .ffx; .fai/.gzi files are not
-read during fetch.
+read during fetch. Use --id-mode prefix for prefix queries or --id-regexp for
+regular-expression queries.
 "#
 }
 
@@ -94,7 +95,8 @@ OPTIONS:
 
 The --fasta path is pure Rust and does not need samtools indexes. The --fai
 and --gzi path is an accelerator when those files already exist; the resulting
-.ffx is still self-contained for fetch.
+.ffx is still self-contained for fetch. Use --id-mode prefix to fetch IDs by
+literal prefix, or --id-regexp to select indexed IDs with a regular expression.
 "#
 }
 
@@ -152,7 +154,6 @@ fn parse_fetch_args() -> Result<FetchArgs, String> {
             "--verbose-missing" => verbose_missing = true,
             "--temp-directory" => temp_directory = arguments.next(),
             "--full-id" => id_mode = IdMode::Exact,
-            "--short-id" => id_mode = IdMode::Prefix,
             "-h" | "--help" => return Err(usage().to_string()),
             _ if argument.starts_with('-') => {
                 return Err(format!("Unknown option: {argument}\n\n{}", usage()));
