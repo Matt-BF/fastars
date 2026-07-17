@@ -112,8 +112,10 @@ Invert the regex to fetch everything whose full ID does not match:
 ```bash
 fastars --fasta sequences.fna.bgz \
   --id-regexp 'GVMAG' \
-  --invert-match > non_gvmag_records.fna
+  -v > non_gvmag_records.fna
 ```
+
+`-v` and `--invert-match` are equivalent.
 
 Regex mode is useful for broad metadata-style searches. For large ID lists,
 prefer exact or prefix lookup with `-f` because it uses binary search over the

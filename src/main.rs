@@ -57,7 +57,7 @@ FETCH OPTIONS:
     -f, --ids-file <FILE>      Read one query ID per line.
     --id-mode <MODE>           Query mode for IDs: exact or prefix. Default: exact
     --id-regexp <REGEX>        Select indexed full IDs matching this regex.
-    --invert-match             With --id-regexp, select IDs that do not match.
+    -v, --invert-match         With --id-regexp, select IDs that do not match.
     --sort-by-offset           Fetch in FASTA order instead of request/index order.
     --verbose-missing          Print every exact/prefix query with no matches.
     --temp-directory <DIR>     Directory for temporary files if auto-indexing.
@@ -149,7 +149,7 @@ fn parse_fetch_args() -> Result<FetchArgs, String> {
                 id_mode = parse_id_mode(&value)?;
             }
             "--id-regexp" => id_regexp = arguments.next(),
-            "--invert-match" => invert_match = true,
+            "-v" | "--invert-match" => invert_match = true,
             "--sort-by-offset" => sort_by_offset = true,
             "--verbose-missing" => verbose_missing = true,
             "--temp-directory" => temp_directory = arguments.next(),
