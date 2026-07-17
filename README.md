@@ -97,6 +97,7 @@ fastars --fasta sequences.fna.bgz \
 
 With `--id-mode exact`, each line must be a full exact ID. With
 `--id-mode prefix`, each line is treated as a literal prefix.
+`-m` is the short form of `--id-mode`.
 
 ## Search indexed IDs with regex
 
@@ -116,6 +117,7 @@ fastars --fasta sequences.fna.bgz \
 ```
 
 `-v` and `--invert-match` are equivalent.
+`-r` is the short form of `--id-regexp`.
 
 Regex mode is useful for broad metadata-style searches. For large ID lists,
 prefer exact or prefix lookup with `-f` because it uses binary search over the
@@ -125,7 +127,7 @@ sorted ID index.
 
 By default, exact and prefix results follow query order, and regex results
 follow sorted ID order. Use `--sort-by-offset` to fetch in FASTA order, which
-can reduce random disk access for many records:
+can reduce random disk access for many records. `-s` is its short form:
 
 ```bash
 fastars --fasta sequences.fna.bgz \

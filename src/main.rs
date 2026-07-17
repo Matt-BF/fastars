@@ -55,10 +55,10 @@ FETCH OPTIONS:
     --fasta <FILE>             BGZF-compressed FASTA to read. Required.
     --ffx <FILE>               Self-contained index. Default: <FASTA>.ffx
     -f, --ids-file <FILE>      Read one query ID per line.
-    --id-mode <MODE>           Query mode for IDs: exact or prefix. Default: exact
-    --id-regexp <REGEX>        Select indexed full IDs matching this regex.
+    -m, --id-mode <MODE>       Query mode for IDs: exact or prefix. Default: exact
+    -r, --id-regexp <REGEX>    Select indexed full IDs matching this regex.
     -v, --invert-match         With --id-regexp, select IDs that do not match.
-    --sort-by-offset           Fetch in FASTA order instead of request/index order.
+    -s, --sort-by-offset       Fetch in FASTA order instead of request/index order.
     --verbose-missing          Print every exact/prefix query with no matches.
     --temp-directory <DIR>     Directory for temporary files if auto-indexing.
     -h, --help                 Print this help message.
@@ -142,15 +142,15 @@ fn parse_fetch_args() -> Result<FetchArgs, String> {
             "--fasta" => fasta = arguments.next(),
             "--ffx" => ffx = arguments.next(),
             "-f" | "--ids-file" => ids_file = arguments.next(),
-            "--id-mode" => {
+            "-m" | "--id-mode" => {
                 let value = arguments
                     .next()
                     .ok_or_else(|| "--id-mode needs a value".to_string())?;
                 id_mode = parse_id_mode(&value)?;
             }
-            "--id-regexp" => id_regexp = arguments.next(),
+            "-r" | "--id-regexp" => id_regexp = arguments.next(),
             "-v" | "--invert-match" => invert_match = true,
-            "--sort-by-offset" => sort_by_offset = true,
+            "-s" | "--sort-by-offset" => sort_by_offset = true,
             "--verbose-missing" => verbose_missing = true,
             "--temp-directory" => temp_directory = arguments.next(),
             "--full-id" => id_mode = IdMode::Exact,
