@@ -3,3 +3,4 @@
 *.tmp
 *.unsorted
 */docs/ai/*
+/benchmarks/data/*.bgz
