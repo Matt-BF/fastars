@@ -9,7 +9,7 @@ Use `fastars index` to build an index and `fastars fetch` to retrieve records.
 ## Requirements
 
 - Rust and Cargo to build the program.
-- The system zstd library and `pkg-config` to build compressed index support.
+- A C compiler for the bundled zstd library.
 - A BGZF-compressed (`.bgz`) or uncompressed FASTA. Plain gzip and zstd
   compression are not supported.
 
