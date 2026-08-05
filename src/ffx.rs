@@ -11,7 +11,7 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
-pub(crate) use writer::IndexWriter;
+pub(crate) use writer::{IndexStats, IndexWriter};
 
 const CACHE_BLOCKS: usize = 4;
 
@@ -209,6 +209,34 @@ mod tests {
         assert!(writer.add(record("a", 2)).is_err());
         drop(writer);
         assert!(!output.exists());
+    }
+
+    #[test]
+    fn parallel_writer_matches_serial_output() {
+        let serial_output = path("serial");
+        let parallel_output = path("parallel");
+        let records = (0..20)
+            .map(|value| record(&format!("id-{value:03}"), value))
+            .collect::<Vec<_>>();
+
+        let mut serial =
+            IndexWriter::with_limits(serial_output.to_str().unwrap(), 2, 1024).unwrap();
+        let mut parallel =
+            IndexWriter::with_limits_and_threads(parallel_output.to_str().unwrap(), 2, 1024, 4)
+                .unwrap();
+        for value in records {
+            serial.add(value.clone()).unwrap();
+            parallel.add(value).unwrap();
+        }
+        serial.finish().unwrap();
+        parallel.finish().unwrap();
+
+        assert_eq!(
+            fs::read(&serial_output).unwrap(),
+            fs::read(&parallel_output).unwrap()
+        );
+        fs::remove_file(serial_output).unwrap();
+        fs::remove_file(parallel_output).unwrap();
     }
 
     #[test]

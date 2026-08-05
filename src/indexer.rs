@@ -1,13 +1,26 @@
-use crate::bgzf::{BgzfLine, BgzfReader};
-use crate::ffx::{IndexRecord, IndexWriter, read_u64};
+mod external_sort;
+mod scanner;
+
+use crate::fasta::FastaReader;
+use crate::ffx::{IndexRecord, IndexStats, IndexWriter, read_u64};
 use std::error::Error;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, BufWriter, Seek, SeekFrom, Write};
+use std::mem;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-#[derive(Clone, Copy)]
-struct RecordMetadata {
+pub const DEFAULT_SORT_MEMORY_MIB: usize = 512;
+static NEXT_TEMPORARY_FILE: AtomicU64 = AtomicU64::new(0);
+
+pub fn default_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct RecordMetadata {
     virtual_offset: u64,
     sequence_length: u64,
     line_bases: u64,
@@ -18,34 +31,16 @@ pub fn build_index_from_fasta(
     fasta_path: &str,
     output_path: &str,
     temp_directory: Option<&str>,
+    sort_memory_bytes: usize,
+    threads: usize,
 ) -> Result<(), Box<dyn Error>> {
-    let mut reader = BgzfReader::new(fasta_path)?;
-    let mut builder = IndexBuilder::new(output_path, temp_directory)?;
-    let mut pending_header = None;
+    let mut reader = FastaReader::with_threads(fasta_path, threads)?;
+    let mut builder = IndexBuilder::new(output_path, temp_directory, sort_memory_bytes, threads)?;
+    scanner::scan_fasta(&mut reader, |full_id, metadata| {
+        builder.add_record(&full_id, metadata)
+    })?;
 
-    loop {
-        let header = match pending_header.take() {
-            Some(line) => line,
-            None => match reader.read_line()? {
-                Some(line) => line,
-                None => break,
-            },
-        };
-
-        if !header.bytes.starts_with(b">") {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Expected FASTA header line starting with '>'",
-            )
-            .into());
-        }
-
-        let full_id = parse_header_id(&header.bytes)?;
-        let (metadata, next_header) = read_record_metadata(&mut reader)?;
-        builder.add_record(&full_id, metadata)?;
-        pending_header = next_header;
-    }
-
+    drop(reader);
     builder.finish(output_path)?;
     Ok(())
 }
@@ -55,11 +50,13 @@ pub fn build_index_from_fai_gzi(
     gzi_path: &str,
     output_path: &str,
     temp_directory: Option<&str>,
+    sort_memory_bytes: usize,
+    threads: usize,
 ) -> Result<(), Box<dyn Error>> {
     let mut gzi = File::open(gzi_path)?;
     let gzi_count = read_gzi_count(&mut gzi)?;
     let reader = BufReader::new(File::open(fai_path)?);
-    let mut builder = IndexBuilder::new(output_path, temp_directory)?;
+    let mut builder = IndexBuilder::new(output_path, temp_directory, sort_memory_bytes, threads)?;
 
     for line in reader.lines() {
         let line = line?;
@@ -75,69 +72,7 @@ pub fn build_index_from_fai_gzi(
     Ok(())
 }
 
-fn read_record_metadata(reader: &mut BgzfReader) -> io::Result<(RecordMetadata, Option<BgzfLine>)> {
-    let mut sequence_offset = None;
-    let mut sequence_length = 0;
-    let mut line_bases = 0;
-    let mut line_width = 0;
-    let mut previous_bases = None;
-    let mut previous_width = None;
-
-    while let Some(line) = reader.read_line()? {
-        if line.bytes.starts_with(b">") {
-            let metadata =
-                finish_metadata(sequence_offset, sequence_length, line_bases, line_width)?;
-            return Ok((metadata, Some(line)));
-        }
-
-        let (bases, width) = sequence_line_layout(&line.bytes)?;
-        if bases == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Empty FASTA sequence lines are not supported",
-            ));
-        }
-
-        if let (Some(previous_bases), Some(previous_width)) = (previous_bases, previous_width)
-            && (previous_bases != line_bases || previous_width != line_width)
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Variable-width FASTA wrapping is not supported",
-            ));
-        }
-
-        if sequence_offset.is_none() {
-            sequence_offset = Some(line.start_virtual);
-            line_bases = bases;
-            line_width = width;
-        }
-        sequence_length += bases;
-        previous_bases = Some(bases);
-        previous_width = Some(width);
-    }
-
-    let metadata = finish_metadata(sequence_offset, sequence_length, line_bases, line_width)?;
-    Ok((metadata, None))
-}
-
-fn finish_metadata(
-    sequence_offset: Option<u64>,
-    sequence_length: u64,
-    line_bases: u64,
-    line_width: u64,
-) -> io::Result<RecordMetadata> {
-    Ok(RecordMetadata {
-        virtual_offset: sequence_offset.ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "FASTA record has no sequence")
-        })?,
-        sequence_length,
-        line_bases,
-        line_width,
-    })
-}
-
-fn parse_header_id(bytes: &[u8]) -> io::Result<String> {
+pub(super) fn parse_header_id(bytes: &[u8]) -> io::Result<String> {
     let mut end = bytes.len();
     if end > 0 && bytes[end - 1] == b'\n' {
         end -= 1;
@@ -162,7 +97,7 @@ fn parse_header_id(bytes: &[u8]) -> io::Result<String> {
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Non-UTF-8 FASTA ID"))
 }
 
-fn sequence_line_layout(bytes: &[u8]) -> io::Result<(u64, u64)> {
+pub(super) fn sequence_line_layout(bytes: &[u8]) -> io::Result<(u64, u64)> {
     let mut base_len = bytes.len();
     if base_len > 0 && bytes[base_len - 1] == b'\n' {
         base_len -= 1;
@@ -210,15 +145,29 @@ fn parse_fai_record(line: &str) -> io::Result<(String, RecordMetadata)> {
 }
 
 struct IndexBuilder {
-    sort_input: BufWriter<File>,
+    records: Vec<IndexRecord>,
+    buffered_bytes: usize,
+    sort_memory_bytes: usize,
+    threads: usize,
+    sort_input: Option<BufWriter<File>>,
     record_count: u64,
+    last_id: Option<String>,
+    input_is_sorted: bool,
     sort_input_path: PathBuf,
-    sort_output_path: PathBuf,
-    temp_directory: Option<PathBuf>,
 }
 
 impl IndexBuilder {
-    fn new(output_path: &str, temp_directory: Option<&str>) -> io::Result<Self> {
+    fn new(
+        output_path: &str,
+        temp_directory: Option<&str>,
+        sort_memory_bytes: usize,
+        threads: usize,
+    ) -> io::Result<Self> {
+        if sort_memory_bytes == 0 || threads == 0 {
+            return Err(io::Error::other(
+                "Sort memory and thread count must be greater than zero",
+            ));
+        }
         let output = Path::new(output_path);
         let temp_root = temp_directory
             .map(PathBuf::from)
@@ -228,15 +177,19 @@ impl IndexBuilder {
         fs::create_dir_all(&temp_root)?;
 
         let pid = std::process::id();
-        let sort_input_path = temp_root.join(format!("fastars-{pid}.sort-input.tmp"));
-        let sort_output_path = temp_root.join(format!("fastars-{pid}.sort-output.tmp"));
+        let nonce = NEXT_TEMPORARY_FILE.fetch_add(1, Ordering::Relaxed);
+        let sort_input_path = temp_root.join(format!("fastars-{pid}-{nonce}.sort-input.tmp"));
 
         Ok(Self {
-            sort_input: BufWriter::new(File::create(&sort_input_path)?),
+            records: Vec::new(),
+            buffered_bytes: 0,
+            sort_memory_bytes,
+            threads,
+            sort_input: None,
             record_count: 0,
+            last_id: None,
+            input_is_sorted: true,
             sort_input_path,
-            sort_output_path,
-            temp_directory: temp_directory.map(PathBuf::from),
         })
     }
 
@@ -248,14 +201,37 @@ impl IndexBuilder {
             ));
         }
 
-        writeln!(
-            self.sort_input,
-            "{full_id}\t{}\t{}\t{}\t{}",
-            metadata.virtual_offset,
-            metadata.sequence_length,
-            metadata.line_bases,
-            metadata.line_width
-        )?;
+        if self
+            .last_id
+            .as_deref()
+            .is_some_and(|previous| previous > full_id)
+        {
+            self.input_is_sorted = false;
+        }
+        self.last_id = Some(full_id.to_string());
+
+        let record = IndexRecord {
+            full_id: full_id.to_string(),
+            virtual_offset: metadata.virtual_offset,
+            sequence_length: metadata.sequence_length,
+            line_bases: metadata.line_bases,
+            line_width: metadata.line_width,
+        };
+        if let Some(sort_input) = &mut self.sort_input {
+            external_sort::write_record(sort_input, &record)?;
+        } else {
+            let record_bytes = sort_memory_cost(&record);
+            if self
+                .buffered_bytes
+                .checked_add(record_bytes)
+                .is_some_and(|total| total <= self.sort_memory_bytes)
+            {
+                self.buffered_bytes += record_bytes;
+                self.records.push(record);
+            } else {
+                self.spill_records(record)?;
+            }
+        }
 
         self.record_count = self
             .record_count
@@ -265,92 +241,93 @@ impl IndexBuilder {
     }
 
     fn finish(mut self, output_path: &str) -> Result<(), Box<dyn Error>> {
-        self.sort_input.flush()?;
-
-        let mut sort = Command::new("sort");
-        sort.env("LC_ALL", "C")
-            .arg("-t")
-            .arg("\t")
-            .arg("-k1,1")
-            .arg("-s");
-        if let Some(directory) = &self.temp_directory {
-            sort.arg("-T").arg(directory);
-        }
-        let status = sort
-            .arg(&self.sort_input_path)
-            .arg("-o")
-            .arg(&self.sort_output_path)
-            .status()?;
-        if !status.success() {
-            return Err(io::Error::other("sort failed while building .ffx").into());
-        }
-
-        let sorted = BufReader::new(File::open(&self.sort_output_path)?);
-        let mut writer = IndexWriter::new(output_path)?;
-        let mut ordered_count = 0;
-        for line in sorted.lines() {
-            writer.add(parse_sorted_record(&line?)?)?;
-            ordered_count += 1;
-        }
-
-        if ordered_count != self.record_count {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Sorted index record count does not match scanned FASTA records",
-            )
-            .into());
-        }
-        let stats = writer.finish()?;
-        let ratio = if stats.raw_block_bytes == 0 {
-            0.0
+        let stats = if let Some(mut sort_input) = self.sort_input.take() {
+            sort_input.flush()?;
+            drop(sort_input);
+            self.write_spilled_index(output_path)?
         } else {
-            stats.stored_block_bytes as f64 / stats.raw_block_bytes as f64
+            if !self.input_is_sorted {
+                self.records
+                    .sort_by(|left, right| left.full_id.cmp(&right.full_id));
+            } else {
+                eprintln!("[INFO] input IDs are already sorted; skipping sort");
+            }
+            let records = mem::take(&mut self.records);
+            write_record_index(records, output_path, self.record_count, self.threads)?
         };
-        eprintln!(
-            "[INFO] indexed {} records in {} blocks; {} bytes on disk (blocks compressed to {:.1}%)",
-            stats.record_count,
-            stats.block_count,
-            stats.file_size,
-            ratio * 100.0
-        );
+        report_stats(&stats);
         Ok(())
     }
+
+    fn spill_records(&mut self, record: IndexRecord) -> io::Result<()> {
+        eprintln!("[INFO] sort memory limit reached; spilling records for external sort");
+        let mut sort_input = BufWriter::new(File::create(&self.sort_input_path)?);
+        for buffered in self.records.drain(..) {
+            external_sort::write_record(&mut sort_input, &buffered)?;
+        }
+        external_sort::write_record(&mut sort_input, &record)?;
+        self.buffered_bytes = 0;
+        self.sort_input = Some(sort_input);
+        Ok(())
+    }
+
+    fn write_spilled_index(&self, output_path: &str) -> Result<IndexStats, Box<dyn Error>> {
+        Ok(external_sort::write_index(
+            &self.sort_input_path,
+            output_path,
+            self.record_count,
+            self.sort_memory_bytes,
+            self.threads,
+            self.input_is_sorted,
+        )?)
+    }
+}
+
+fn sort_memory_cost(record: &IndexRecord) -> usize {
+    record
+        .full_id
+        .len()
+        .saturating_add(3 * mem::size_of::<IndexRecord>())
+}
+
+fn report_stats(stats: &IndexStats) {
+    let ratio = if stats.raw_block_bytes == 0 {
+        0.0
+    } else {
+        stats.stored_block_bytes as f64 / stats.raw_block_bytes as f64
+    };
+    eprintln!(
+        "[INFO] indexed {} records in {} blocks; {} bytes on disk (blocks compressed to {:.1}%)",
+        stats.record_count,
+        stats.block_count,
+        stats.file_size,
+        ratio * 100.0
+    );
 }
 
 impl Drop for IndexBuilder {
     fn drop(&mut self) {
-        for path in [&self.sort_input_path, &self.sort_output_path] {
-            let _ = fs::remove_file(path);
-        }
+        let _ = fs::remove_file(&self.sort_input_path);
     }
 }
 
-fn parse_sorted_record(line: &str) -> io::Result<IndexRecord> {
-    let mut fields = line.split('\t');
-    let full_id = fields.next().unwrap_or_default();
-    let virtual_offset = parse_sorted_u64(fields.next(), "virtual offset")?;
-    let sequence_length = parse_sorted_u64(fields.next(), "sequence length")?;
-    let line_bases = parse_sorted_u64(fields.next(), "line bases")?;
-    let line_width = parse_sorted_u64(fields.next(), "line width")?;
-    if full_id.is_empty() || fields.next().is_some() {
+fn write_record_index(
+    records: Vec<IndexRecord>,
+    output_path: &str,
+    expected_records: u64,
+    threads: usize,
+) -> io::Result<IndexStats> {
+    if records.len() as u64 != expected_records {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "Malformed sorted index row",
+            "Buffered index record count does not match scanned FASTA records",
         ));
     }
-    Ok(IndexRecord {
-        full_id: full_id.to_string(),
-        virtual_offset,
-        sequence_length,
-        line_bases,
-        line_width,
-    })
-}
-
-fn parse_sorted_u64(value: Option<&str>, field: &str) -> io::Result<u64> {
-    value
-        .and_then(|value| value.parse().ok())
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, format!("Invalid {field}")))
+    let mut writer = IndexWriter::with_threads(output_path, threads)?;
+    for record in records {
+        writer.add(record)?;
+    }
+    writer.finish()
 }
 
 fn read_gzi_count(file: &mut File) -> io::Result<u64> {
@@ -426,6 +403,8 @@ mod tests {
             gzi.to_str().unwrap(),
             output.to_str().unwrap(),
             None,
+            1,
+            2,
         )
         .unwrap();
 
@@ -440,9 +419,86 @@ mod tests {
     }
 
     #[test]
-    fn sorted_row_parser_rejects_extra_fields() {
-        assert!(parse_sorted_record("id\t1\t2\t3\t4\textra").is_err());
-        assert!(parse_sorted_record("id\t1\t2\t3").is_err());
+    fn plain_fasta_builder_indexes_byte_offsets() {
+        let fasta = test_path("input.fna");
+        let output = test_path("plain-output.ffx");
+        fs::write(&fasta, b">zeta description\nACGT\nAC\n>alpha\nTTT\n").unwrap();
+
+        build_index_from_fasta(
+            fasta.to_str().unwrap(),
+            output.to_str().unwrap(),
+            None,
+            usize::MAX,
+            4,
+        )
+        .unwrap();
+
+        let mut index = FfxIndex::open(output.to_str().unwrap()).unwrap();
+        let alpha = index.find_exact("alpha").unwrap().pop().unwrap();
+        let zeta = index.find_exact("zeta").unwrap().pop().unwrap();
+        assert_eq!(alpha.virtual_offset, 33);
+        assert_eq!(alpha.sequence_length, 3);
+        assert_eq!(zeta.virtual_offset, 18);
+        assert_eq!(zeta.sequence_length, 6);
+        assert_eq!((zeta.line_bases, zeta.line_width), (4, 5));
+
+        for path in [fasta, output] {
+            fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn builder_detects_sorted_and_unsorted_ids() {
+        let directory = test_path("ordering-directory");
+        fs::create_dir(&directory).unwrap();
+        let output = directory.join("output.ffx");
+        let metadata = RecordMetadata {
+            virtual_offset: 0,
+            sequence_length: 1,
+            line_bases: 1,
+            line_width: 2,
+        };
+        let mut builder =
+            IndexBuilder::new(output.to_str().unwrap(), directory.to_str(), usize::MAX, 1).unwrap();
+
+        builder.add_record("alpha", metadata).unwrap();
+        builder.add_record("alpha", metadata).unwrap();
+        builder.add_record("zeta", metadata).unwrap();
+        assert!(builder.input_is_sorted);
+
+        builder.add_record("beta", metadata).unwrap();
+        assert!(!builder.input_is_sorted);
+
+        drop(builder);
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn in_memory_sort_preserves_duplicate_input_order() {
+        let output = test_path("memory-sort.ffx");
+        let metadata = |virtual_offset| RecordMetadata {
+            virtual_offset,
+            sequence_length: 1,
+            line_bases: 1,
+            line_width: 2,
+        };
+        let mut builder = IndexBuilder::new(output.to_str().unwrap(), None, usize::MAX, 2).unwrap();
+        builder.add_record("zeta", metadata(30)).unwrap();
+        builder.add_record("duplicate", metadata(20)).unwrap();
+        builder.add_record("duplicate", metadata(10)).unwrap();
+        builder.add_record("alpha", metadata(0)).unwrap();
+        builder.finish(output.to_str().unwrap()).unwrap();
+
+        let mut index = FfxIndex::open(output.to_str().unwrap()).unwrap();
+        let offsets = index
+            .find_exact("duplicate")
+            .unwrap()
+            .into_iter()
+            .map(|record| record.virtual_offset)
+            .collect::<Vec<_>>();
+        assert_eq!(offsets, vec![20, 10]);
+
+        fs::remove_file(output).unwrap();
     }
 
     #[test]
@@ -450,12 +506,38 @@ mod tests {
         let directory = test_path("temporary-directory");
         fs::create_dir(&directory).unwrap();
         let output = directory.join("output.ffx");
-        let builder = IndexBuilder::new(output.to_str().unwrap(), directory.to_str()).unwrap();
+        let builder =
+            IndexBuilder::new(output.to_str().unwrap(), directory.to_str(), usize::MAX, 1).unwrap();
         let input = builder.sort_input_path.clone();
-        let sorted = builder.sort_output_path.clone();
         drop(builder);
         assert!(!input.exists());
-        assert!(!sorted.exists());
         fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn external_sort_preserves_duplicate_input_order() {
+        let output = test_path("external-sort.ffx");
+        let metadata = |virtual_offset| RecordMetadata {
+            virtual_offset,
+            sequence_length: 1,
+            line_bases: 1,
+            line_width: 2,
+        };
+        let mut builder = IndexBuilder::new(output.to_str().unwrap(), None, 1, 2).unwrap();
+        builder.add_record("zeta", metadata(30)).unwrap();
+        builder.add_record("duplicate", metadata(20)).unwrap();
+        builder.add_record("alpha", metadata(0)).unwrap();
+        builder.add_record("duplicate", metadata(10)).unwrap();
+        builder.finish(output.to_str().unwrap()).unwrap();
+
+        let mut index = FfxIndex::open(output.to_str().unwrap()).unwrap();
+        let offsets = index
+            .find_exact("duplicate")
+            .unwrap()
+            .into_iter()
+            .map(|record| record.virtual_offset)
+            .collect::<Vec<_>>();
+        assert_eq!(offsets, vec![20, 10]);
+        fs::remove_file(output).unwrap();
     }
 }

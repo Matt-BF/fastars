@@ -1,10 +1,13 @@
 mod bgzf;
+mod fasta;
 mod ffx;
 mod indexer;
 
-use crate::bgzf::BgzfReader;
+use crate::fasta::FastaReader;
 use crate::ffx::{FfxIndex, FfxRecord};
-use crate::indexer::{build_index_from_fai_gzi, build_index_from_fasta};
+use crate::indexer::{
+    DEFAULT_SORT_MEMORY_MIB, build_index_from_fai_gzi, build_index_from_fasta, default_threads,
+};
 use regex::Regex;
 use std::collections::HashSet;
 use std::env;
@@ -29,6 +32,8 @@ struct FetchArgs {
     id_regexp: Option<String>,
     invert_match: bool,
     temp_directory: Option<String>,
+    sort_memory_bytes: usize,
+    threads: usize,
     ids: Vec<String>,
 }
 
@@ -38,10 +43,12 @@ struct IndexArgs {
     gzi: Option<String>,
     output: Option<String>,
     temp_directory: Option<String>,
+    sort_memory_bytes: usize,
+    threads: usize,
 }
 
 fn usage() -> &'static str {
-    r#"fastars — fast random retrieval from BGZF-compressed FASTA files
+    r#"fastars — fast random retrieval from BGZF-compressed or plain FASTA files
 
 USAGE:
     fastars fetch --fasta <FASTA.bgz> [OPTIONS] [ID ...]
@@ -53,7 +60,7 @@ COMMANDS:
     index    Build a compressed, self-contained .ffx index.
 
 FETCH OPTIONS:
-    --fasta <FILE>             BGZF-compressed FASTA to read. Required.
+    --fasta <FILE>             BGZF-compressed or plain FASTA. Required.
     --ffx <FILE>               Self-contained index. Default: <FASTA>.ffx
     -f, --ids-file <FILE>      Read one query ID per line.
     -m, --id-mode <MODE>       Query mode for IDs: exact or prefix. Default: exact
@@ -62,18 +69,22 @@ FETCH OPTIONS:
     -s, --sort-by-offset       Fetch in FASTA order instead of request/index order.
     --verbose-missing          Print every exact/prefix query with no matches.
     --temp-directory <DIR>     Directory for temporary files if auto-indexing.
+    --sort-memory <MiB>        Auto-index sort memory budget. Default: 512
+    --threads <N>              Auto-index worker threads. Default: available CPUs
     -h, --help                 Print this help message.
 
 INDEX OPTIONS:
-    --fasta <FILE>             Build .ffx by scanning a BGZF FASTA directly.
+    --fasta <FILE>             Build .ffx by scanning a BGZF or plain FASTA.
     --fai <FILE>               Optional build source: existing FASTA .fai.
     --gzi <FILE>               Required with --fai to convert offsets once.
     --output <FILE>            Output index. Default: <FASTA>.ffx or <FAI>.ffx
     --temp-directory <DIR>     Directory for external sort temporary files.
+    --sort-memory <MiB>        Memory budget before external sort. Default: 512
+    --threads <N>              Index worker threads. Default: available CPUs
     -h, --help                 Print index-specific help.
 
-The .ffx stores full IDs, BGZF virtual offsets, sequence lengths, and line
-layout. Fetching needs only the BGZF FASTA and .ffx; .fai/.gzi files are not
+The .ffx stores full IDs, FASTA offsets, sequence lengths, and line layout.
+Fetching needs only the FASTA and .ffx; .fai/.gzi files are not
 read during fetch. Use --id-mode prefix for prefix queries or --id-regexp for
 regular-expression queries.
 "#
@@ -87,11 +98,13 @@ USAGE:
     fastars index --fai <FASTA.bgz.fai> --gzi <FASTA.bgz.gzi> [OPTIONS]
 
 OPTIONS:
-    --fasta <FILE>             Build by scanning a BGZF FASTA directly.
+    --fasta <FILE>             Build by scanning a BGZF or plain FASTA.
     --fai <FILE>               Build from an existing .fai file.
     --gzi <FILE>               BGZF .gzi file. Required with --fai.
     --output <FILE>            Output index. Default: <FASTA>.ffx or <FAI>.ffx
     --temp-directory <DIR>     Directory for external sort temporary files.
+    --sort-memory <MiB>        Memory budget before external sort. Default: 512
+    --threads <N>              Index worker threads. Default: available CPUs
     -h, --help                 Print this help message.
 
 The --fasta path is pure Rust and does not need samtools indexes. The --fai
@@ -135,6 +148,8 @@ fn parse_fetch_args() -> Result<FetchArgs, String> {
     let mut id_regexp = None;
     let mut invert_match = false;
     let mut temp_directory = None;
+    let mut sort_memory_mib = DEFAULT_SORT_MEMORY_MIB;
+    let mut threads = default_threads();
     let mut ids = Vec::new();
     let mut arguments = env::args().skip(2);
 
@@ -154,6 +169,28 @@ fn parse_fetch_args() -> Result<FetchArgs, String> {
             "-s" | "--sort-by-offset" => sort_by_offset = true,
             "--verbose-missing" => verbose_missing = true,
             "--temp-directory" => temp_directory = arguments.next(),
+            "--sort-memory" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "--sort-memory needs a MiB value".to_string())?;
+                sort_memory_mib = value
+                    .parse()
+                    .map_err(|_| format!("Invalid --sort-memory value: {value}"))?;
+                if sort_memory_mib == 0 {
+                    return Err("--sort-memory must be greater than zero".to_string());
+                }
+            }
+            "--threads" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "--threads needs a value".to_string())?;
+                threads = value
+                    .parse()
+                    .map_err(|_| format!("Invalid --threads value: {value}"))?;
+                if threads == 0 {
+                    return Err("--threads must be greater than zero".to_string());
+                }
+            }
             "--full-id" => id_mode = IdMode::Exact,
             "-h" | "--help" => return Err(usage().to_string()),
             _ if argument.starts_with('-') => {
@@ -164,6 +201,9 @@ fn parse_fetch_args() -> Result<FetchArgs, String> {
     }
 
     let fasta = fasta.ok_or_else(|| format!("--fasta is required\n\n{}", usage()))?;
+    let sort_memory_bytes = sort_memory_mib
+        .checked_mul(1024 * 1024)
+        .ok_or_else(|| "--sort-memory value is too large".to_string())?;
     Ok(FetchArgs {
         ffx: ffx.unwrap_or_else(|| default_ffx_path(&fasta)),
         fasta,
@@ -174,6 +214,8 @@ fn parse_fetch_args() -> Result<FetchArgs, String> {
         id_regexp,
         invert_match,
         temp_directory,
+        sort_memory_bytes,
+        threads,
         ids,
     })
 }
@@ -184,6 +226,8 @@ fn parse_index_args() -> Result<IndexArgs, String> {
     let mut gzi = None;
     let mut output = None;
     let mut temp_directory = None;
+    let mut sort_memory_mib = DEFAULT_SORT_MEMORY_MIB;
+    let mut threads = default_threads();
     let mut arguments = env::args().skip(2);
 
     while let Some(argument) = arguments.next() {
@@ -193,6 +237,28 @@ fn parse_index_args() -> Result<IndexArgs, String> {
             "--gzi" => gzi = arguments.next(),
             "--output" => output = arguments.next(),
             "--temp-directory" => temp_directory = arguments.next(),
+            "--sort-memory" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "--sort-memory needs a MiB value".to_string())?;
+                sort_memory_mib = value
+                    .parse()
+                    .map_err(|_| format!("Invalid --sort-memory value: {value}"))?;
+                if sort_memory_mib == 0 {
+                    return Err("--sort-memory must be greater than zero".to_string());
+                }
+            }
+            "--threads" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "--threads needs a value".to_string())?;
+                threads = value
+                    .parse()
+                    .map_err(|_| format!("Invalid --threads value: {value}"))?;
+                if threads == 0 {
+                    return Err("--threads must be greater than zero".to_string());
+                }
+            }
             "-h" | "--help" => {
                 println!("{}", index_usage());
                 std::process::exit(0);
@@ -206,12 +272,17 @@ fn parse_index_args() -> Result<IndexArgs, String> {
         }
     }
 
+    let sort_memory_bytes = sort_memory_mib
+        .checked_mul(1024 * 1024)
+        .ok_or_else(|| "--sort-memory value is too large".to_string())?;
     Ok(IndexArgs {
         fasta,
         fai,
         gzi,
         output,
         temp_directory,
+        sort_memory_bytes,
+        threads,
     })
 }
 
@@ -245,11 +316,11 @@ fn add_records(records: Vec<FfxRecord>, seen: &mut HashSet<u64>, output: &mut Ve
 }
 
 fn write_record(
-    reader: &mut BgzfReader,
+    reader: &mut FastaReader,
     output: &mut BufWriter<io::StdoutLock<'_>>,
     record: &FfxRecord,
 ) -> io::Result<()> {
-    reader.seek_virtual(record.virtual_offset)?;
+    reader.seek(record.virtual_offset)?;
     let sequence =
         reader.read_sequence(record.sequence_length, record.line_bases, record.line_width)?;
     writeln!(output, ">{}", record.full_id)?;
@@ -272,7 +343,14 @@ fn run_index_command() -> Result<(), Box<dyn Error>> {
 
     match (arguments.fai.as_deref(), arguments.gzi.as_deref()) {
         (Some(fai), Some(gzi)) => {
-            build_index_from_fai_gzi(fai, gzi, &output, arguments.temp_directory.as_deref())?;
+            build_index_from_fai_gzi(
+                fai,
+                gzi,
+                &output,
+                arguments.temp_directory.as_deref(),
+                arguments.sort_memory_bytes,
+                arguments.threads,
+            )?;
         }
         (Some(_), None) | (None, Some(_)) => {
             return Err(io::Error::other("index requires both --fai and --gzi, or --fasta").into());
@@ -282,7 +360,13 @@ fn run_index_command() -> Result<(), Box<dyn Error>> {
                 .fasta
                 .as_deref()
                 .ok_or_else(|| io::Error::other("index requires --fasta, or --fai with --gzi"))?;
-            build_index_from_fasta(fasta, &output, arguments.temp_directory.as_deref())?;
+            build_index_from_fasta(
+                fasta,
+                &output,
+                arguments.temp_directory.as_deref(),
+                arguments.sort_memory_bytes,
+                arguments.threads,
+            )?;
         }
     }
 
@@ -310,6 +394,8 @@ fn run_fetch_command() -> Result<(), Box<dyn Error>> {
             &arguments.fasta,
             &arguments.ffx,
             arguments.temp_directory.as_deref(),
+            arguments.sort_memory_bytes,
+            arguments.threads,
         )?;
     }
 
@@ -348,7 +434,7 @@ fn run_fetch_command() -> Result<(), Box<dyn Error>> {
         records.sort_by_key(|record| record.virtual_offset);
     }
 
-    let mut reader = BgzfReader::new(&arguments.fasta)?;
+    let mut reader = FastaReader::new(&arguments.fasta)?;
     let stdout = io::stdout();
     let mut output = BufWriter::new(stdout.lock());
     for record in &records {

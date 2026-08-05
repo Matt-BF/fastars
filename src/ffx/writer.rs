@@ -2,7 +2,10 @@ use super::block::{EncodedBlock, IndexRecord, encode_block};
 use super::format::{DirectoryEntry, HEADER_SIZE, Header, write_directory, write_header};
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Seek, SeekFrom, Write};
+use std::mem;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread::{self, JoinHandle};
 
 const TARGET_RECORDS: u32 = 4_096;
 const MAX_RAW_BLOCK_SIZE: usize = 4 * 1024 * 1024;
@@ -28,20 +31,54 @@ pub(crate) struct IndexWriter {
     raw_block_bytes: u64,
     target_records: u32,
     max_raw_block_size: usize,
+    encoder: Option<ParallelEncoder>,
     committed: bool,
 }
 
+struct EncodeJob {
+    sequence: usize,
+    records: Vec<IndexRecord>,
+}
+
+struct EncodeResult {
+    sequence: usize,
+    encoded: io::Result<EncodedBlock>,
+    record_count: u64,
+    last_id: String,
+}
+
+struct ParallelEncoder {
+    senders: Vec<Sender<EncodeJob>>,
+    results: Receiver<EncodeResult>,
+    workers: Vec<JoinHandle<()>>,
+    next_worker: usize,
+    submitted: usize,
+    written: usize,
+    ready: Vec<EncodeResult>,
+    max_in_flight: usize,
+}
+
 impl IndexWriter {
-    pub(crate) fn new(output_path: &str) -> io::Result<Self> {
-        Self::with_limits(output_path, TARGET_RECORDS, MAX_RAW_BLOCK_SIZE)
+    pub(crate) fn with_threads(output_path: &str, threads: usize) -> io::Result<Self> {
+        Self::with_limits_and_threads(output_path, TARGET_RECORDS, MAX_RAW_BLOCK_SIZE, threads)
     }
 
+    #[cfg(test)]
     pub(super) fn with_limits(
         output_path: &str,
         target_records: u32,
         max_raw_block_size: usize,
     ) -> io::Result<Self> {
-        if target_records == 0 || max_raw_block_size == 0 {
+        Self::with_limits_and_threads(output_path, target_records, max_raw_block_size, 1)
+    }
+
+    pub(super) fn with_limits_and_threads(
+        output_path: &str,
+        target_records: u32,
+        max_raw_block_size: usize,
+        threads: usize,
+    ) -> io::Result<Self> {
+        if target_records == 0 || max_raw_block_size == 0 || threads == 0 {
             return Err(io::Error::other("Invalid .ffx block configuration"));
         }
         let output_path = PathBuf::from(output_path);
@@ -71,6 +108,7 @@ impl IndexWriter {
             raw_block_bytes: 0,
             target_records,
             max_raw_block_size,
+            encoder: (threads > 1).then(|| ParallelEncoder::new(threads)),
             committed: false,
         })
     }
@@ -105,6 +143,13 @@ impl IndexWriter {
 
     pub(crate) fn finish(mut self) -> io::Result<IndexStats> {
         self.flush_block()?;
+        while self
+            .encoder
+            .as_ref()
+            .is_some_and(ParallelEncoder::has_pending)
+        {
+            self.write_next_encoded()?;
+        }
         let directory_offset = HEADER_SIZE
             .checked_add(self.blocks_len)
             .ok_or_else(|| io::Error::other(".ffx file is too large"))?;
@@ -142,13 +187,41 @@ impl IndexWriter {
         if self.pending.is_empty() {
             return Ok(());
         }
-        let encoded = encode_block(&self.pending)?;
+        let records = mem::take(&mut self.pending);
+        self.pending_size = 0;
+        if let Some(encoder) = &mut self.encoder {
+            encoder.submit(records)?;
+            if encoder.in_flight() >= encoder.max_in_flight {
+                self.write_next_encoded()?;
+            }
+            return Ok(());
+        }
+
+        let record_count = records.len() as u64;
+        let last_id = records.last().unwrap().full_id.clone();
+        let encoded = encode_block(&records)?;
+        self.write_encoded(encoded, record_count, last_id)
+    }
+
+    fn write_next_encoded(&mut self) -> io::Result<()> {
+        let result = self
+            .encoder
+            .as_mut()
+            .ok_or_else(|| io::Error::other("Parallel encoder is not configured"))?
+            .receive_next()?;
+        self.write_encoded(result.encoded?, result.record_count, result.last_id)
+    }
+
+    fn write_encoded(
+        &mut self,
+        encoded: EncodedBlock,
+        record_count: u64,
+        last_id: String,
+    ) -> io::Result<()> {
         let stored_len = encoded.stored.len() as u64;
         let block_offset = HEADER_SIZE
             .checked_add(self.blocks_len)
             .ok_or_else(|| io::Error::other(".ffx file is too large"))?;
-        let record_count = self.pending.len() as u64;
-        let last_id = self.pending.last().unwrap().full_id.clone();
         self.output.write_all(&encoded.stored)?;
         self.directory.push(directory_entry(
             block_offset,
@@ -170,9 +243,98 @@ impl IndexWriter {
             .record_count
             .checked_add(record_count)
             .ok_or_else(|| io::Error::other("Too many FASTA records"))?;
-        self.pending.clear();
-        self.pending_size = 0;
         Ok(())
+    }
+}
+
+impl ParallelEncoder {
+    fn new(threads: usize) -> Self {
+        let (result_sender, results) = mpsc::channel();
+        let mut senders = Vec::with_capacity(threads);
+        let mut workers = Vec::with_capacity(threads);
+        for _ in 0..threads {
+            let (sender, receiver) = mpsc::channel::<EncodeJob>();
+            let result_sender = result_sender.clone();
+            workers.push(thread::spawn(move || {
+                while let Ok(job) = receiver.recv() {
+                    let record_count = job.records.len() as u64;
+                    let last_id = job.records.last().unwrap().full_id.clone();
+                    let encoded = encode_block(&job.records);
+                    if result_sender
+                        .send(EncodeResult {
+                            sequence: job.sequence,
+                            encoded,
+                            record_count,
+                            last_id,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }));
+            senders.push(sender);
+        }
+        drop(result_sender);
+        Self {
+            senders,
+            results,
+            workers,
+            next_worker: 0,
+            submitted: 0,
+            written: 0,
+            ready: Vec::new(),
+            max_in_flight: threads.saturating_mul(2),
+        }
+    }
+
+    fn submit(&mut self, records: Vec<IndexRecord>) -> io::Result<()> {
+        let sequence = self.submitted;
+        self.senders[self.next_worker]
+            .send(EncodeJob { sequence, records })
+            .map_err(|_| io::Error::other("Parallel block encoder stopped unexpectedly"))?;
+        self.next_worker = (self.next_worker + 1) % self.senders.len();
+        self.submitted += 1;
+        Ok(())
+    }
+
+    fn receive_next(&mut self) -> io::Result<EncodeResult> {
+        loop {
+            if let Some(position) = self
+                .ready
+                .iter()
+                .position(|result| result.sequence == self.written)
+            {
+                self.written += 1;
+                return Ok(self.ready.swap_remove(position));
+            }
+            let result = self
+                .results
+                .recv()
+                .map_err(|_| io::Error::other("Parallel block encoder stopped unexpectedly"))?;
+            if result.sequence == self.written {
+                self.written += 1;
+                return Ok(result);
+            }
+            self.ready.push(result);
+        }
+    }
+
+    fn in_flight(&self) -> usize {
+        self.submitted - self.written
+    }
+
+    fn has_pending(&self) -> bool {
+        self.written < self.submitted
+    }
+}
+
+impl Drop for ParallelEncoder {
+    fn drop(&mut self) {
+        self.senders.clear();
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
+        }
     }
 }
 

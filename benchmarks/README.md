@@ -1,0 +1,125 @@
+# Local index benchmark
+
+`data/METAVR_sorted.2GiB.fna.bgz` is a local 2 GiB prefix of
+`METAVR_sorted.fna.bgz`. It ends at a complete BGZF block boundary and is
+intended only for performance testing; its final FASTA record may be partial.
+The data file is ignored by Git.
+
+- Compressed size: 2,147,486,355 bytes
+- BGZF blocks: 160,605
+- Indexed records: 263,410
+- SHA-256: `0a91d472ace40d651bff10f056605a44eeb6eff8d3acf453d4ec50d2e22f293c`
+
+Build the release binary before benchmarking:
+
+```bash
+cargo build --release
+```
+
+Benchmark the default in-memory sorting path:
+
+```bash
+hyperfine --warmup 1 \
+  'target/release/fastars index \
+    --fasta benchmarks/data/METAVR_sorted.2GiB.fna.bgz \
+    --output /tmp/fastars-metavr-sample.ffx \
+    --temp-directory /tmp \
+    --threads 32 \
+    --sort-memory 512'
+```
+
+Use a 64 MiB budget to exercise the external-sort fallback:
+
+```bash
+hyperfine --warmup 1 \
+  'target/release/fastars index \
+    --fasta benchmarks/data/METAVR_sorted.2GiB.fna.bgz \
+    --output /tmp/fastars-metavr-sample.ffx \
+    --temp-directory /tmp \
+    --threads 32 \
+    --sort-memory 64'
+```
+
+## BGZF line-scanning result
+
+Replacing byte-at-a-time line reads with block-slice scans produced the
+following local results with `--threads 32 --sort-memory 512`. Wall time varies
+with the shared filesystem, while user CPU is stable.
+
+| Reader | Wall time (s) | User CPU (s) | Peak RSS (KiB) |
+| --- | ---: | ---: | ---: |
+| Byte-at-a-time | 105.18 | 54.33 | 110,252 |
+| Byte-at-a-time | 123.81 | 55.32 | 103,996 |
+| Byte-at-a-time, post-control | 59.15 | 54.53 | 120,732 |
+| Block-slice scan | 39.67 | 37.68 | 106,796 |
+| Block-slice scan | 37.64 | 37.78 | 106,404 |
+
+The block-slice implementation reduced user CPU by about 31%. Against the
+immediately following pre-change control, elapsed time fell by about 35%. The
+generated `.ffx` files were byte-identical.
+
+## Block-aware indexing scanner result
+
+The dedicated indexing scanner consumes decompressed BGZF blocks directly and
+copies only lines that cross a block boundary. A four-thread run reduced user
+CPU by another 10% while producing a byte-identical `.ffx` file.
+
+| Scanner | Wall time (s) | User CPU (s) | Peak RSS (KiB) |
+| --- | ---: | ---: | ---: |
+| Allocated line scan | 44.06 | 36.75 | 49,924 |
+| Block-aware index scan | 44.63 | 32.94 | 46,408 |
+
+The shared filesystem dominated elapsed time during these runs, so user CPU is
+the more reliable measure of the parser improvement.
+
+## BGZF buffer-reuse result
+
+Recycling compressed and decompressed BGZF buffers produced the following
+contemporaneous four-thread comparison:
+
+| Buffer handling | Wall time (s) | User CPU (s) | Peak RSS (KiB) |
+| --- | ---: | ---: | ---: |
+| Allocate per block | 36.69 | 34.93 | 54,664 |
+| Recycle bounded buffers | 42.48 | 33.30 | 51,088 |
+
+The buffer pool reduced user CPU by about 5% and produced a byte-identical
+`.ffx`. Wall time again moved independently with shared-filesystem load.
+
+Keeping a zlib stream initialized in each worker was also tested, but rejected:
+two runs used 37.63 and 37.51 seconds of user CPU, roughly 8% more than the
+contemporaneous baseline. The committed implementation recycles buffers while
+retaining per-block zlib initialization.
+
+## GNU external-sort resource result (historical)
+
+Before the Rust sorter replacement, the spill path passed `--sort-memory` and
+`--threads` through to GNU `sort`. A 16 MiB forced-spill comparison produced
+byte-identical indexes:
+
+| GNU sort configuration | Wall time (s) | User CPU (s) | Peak RSS (KiB) |
+| --- | ---: | ---: | ---: |
+| Implicit defaults | 27.06 | 33.95 | 50,784 |
+| Explicit 16 MiB, 4 threads | 38.01 | 32.86 | 24,960 |
+
+The explicit limit roughly halved peak RSS and modestly reduced CPU. Wall time
+remains too sensitive to shared-filesystem load to claim an elapsed-time gain
+from this single comparison.
+
+## Platform-independent external sort
+
+GNU `sort` was subsequently replaced with an in-process stable external merge
+sort. The Rust implementation writes compact binary runs, merges at most 64
+runs at once, and adds merge passes when necessary to keep file descriptor use
+bounded.
+
+The same 16 MiB forced-spill workload produced:
+
+| Sorter | Wall time (s) | User CPU (s) | System CPU (s) | Peak RSS (KiB) |
+| --- | ---: | ---: | ---: | ---: |
+| GNU sort | 38.01 | 32.86 | 1.36 | 24,960 |
+| Rust external merge | 7.90 | 34.52 | 0.69 | 29,988 |
+
+Both produced the same `.ffx` SHA-256,
+`22d91a1fedea76103e67dcd5a189a4a596a51d3cfbd556b042b3d6af181b6aab`.
+The Rust sorter used about 5% more user CPU and 5 MiB more peak memory. Its wall
+time benefited from a warmer input cache and is not directly comparable.
