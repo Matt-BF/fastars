@@ -29,8 +29,9 @@ target/release/fastars
 ```
 
 Tagged releases are built for Linux x86-64 and macOS on both Apple Silicon and
-Intel. See [the release process](docs/ai/release-process.md) for versioning and
-publishing instructions.
+Intel. Push a tag matching the version in `Cargo.toml`, such as `v0.1.0`, to
+publish the archives on the GitHub Releases page. Manual workflow runs produce
+temporary artifacts on the Actions run without publishing a release.
 
 ## Build an index
 
