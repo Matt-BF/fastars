@@ -32,7 +32,7 @@ pub fn build_index_from_fasta(
     sort_memory_bytes: usize,
     threads: usize,
 ) -> Result<(), Box<dyn Error>> {
-    let mut reader = BgzfReader::new(fasta_path)?;
+    let mut reader = BgzfReader::with_threads(fasta_path, threads)?;
     let mut builder = IndexBuilder::new(output_path, temp_directory, sort_memory_bytes, threads)?;
     let mut pending_header = None;
 
@@ -59,6 +59,7 @@ pub fn build_index_from_fasta(
         pending_header = next_header;
     }
 
+    drop(reader);
     builder.finish(output_path)?;
     Ok(())
 }

@@ -1,3 +1,8 @@
+mod parallel;
+#[cfg(test)]
+mod tests;
+
+use parallel::{LoadedBlock, ParallelBlockLoader};
 use std::ffi::c_void;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
@@ -45,7 +50,7 @@ pub struct BgzfLine {
 }
 
 pub struct BgzfReader {
-    file: File,
+    loader: BlockLoader,
     file_len: u64,
     block_address: u64,
     block_size: u64,
@@ -54,12 +59,39 @@ pub struct BgzfReader {
     started: bool,
 }
 
+enum BlockLoader {
+    Serial(File),
+    Parallel(ParallelBlockLoader),
+}
+
 impl BgzfReader {
     pub fn new<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         let file = File::open(path)?;
         let file_len = file.metadata()?.len();
         Ok(Self {
-            file,
+            loader: BlockLoader::Serial(file),
+            file_len,
+            block_address: 0,
+            block_size: 0,
+            block: Vec::new(),
+            position: 0,
+            started: false,
+        })
+    }
+
+    pub fn with_threads<P: AsRef<Path>>(path: P, threads: usize) -> io::Result<Self> {
+        if threads == 0 {
+            return Err(io::Error::other(
+                "BGZF thread count must be greater than zero",
+            ));
+        }
+        if threads == 1 {
+            return Self::new(path);
+        }
+        let file = File::open(path)?;
+        let file_len = file.metadata()?.len();
+        Ok(Self {
+            loader: BlockLoader::Parallel(ParallelBlockLoader::new(file, file_len, threads)),
             file_len,
             block_address: 0,
             block_size: 0,
@@ -87,6 +119,12 @@ impl BgzfReader {
     }
 
     pub fn seek_virtual(&mut self, offset: u64) -> io::Result<()> {
+        if matches!(self.loader, BlockLoader::Parallel(_)) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Parallel BGZF readers only support sequential access",
+            ));
+        }
         self.load_block(offset >> 16)?;
         self.started = true;
         self.position = (offset & 0xffff) as usize;
@@ -178,58 +216,86 @@ impl BgzfReader {
     }
 
     fn load_block(&mut self, address: u64) -> io::Result<()> {
-        if address >= self.file_len {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "BGZF block address is past end of file",
-            ));
-        }
-
-        self.file.seek(SeekFrom::Start(address))?;
-        let mut header = [0_u8; 12];
-        self.file.read_exact(&mut header)?;
-        if header[..4] != [31, 139, 8, 4] {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Input is not BGZF-compressed data",
-            ));
-        }
-
-        let extra_length = u16::from_le_bytes(header[10..12].try_into().unwrap()) as usize;
-        let mut extra = vec![0_u8; extra_length];
-        self.file.read_exact(&mut extra)?;
-
-        let mut position = 0;
-        let mut block_size = None;
-        while position + 4 <= extra.len() {
-            let field_length =
-                u16::from_le_bytes(extra[position + 2..position + 4].try_into().unwrap()) as usize;
-            if position + 4 + field_length > extra.len() {
-                break;
+        let loaded = match &mut self.loader {
+            BlockLoader::Serial(file) => {
+                let (compressed, size) = read_compressed_block(file, self.file_len, address)?;
+                LoadedBlock {
+                    address,
+                    size,
+                    bytes: gzip_decompress(&compressed)?,
+                }
             }
-            if &extra[position..position + 2] == b"BC" && field_length == 2 {
-                block_size = Some(
-                    u16::from_le_bytes(extra[position + 4..position + 6].try_into().unwrap())
-                        as u64
-                        + 1,
-                );
-                break;
-            }
-            position += 4 + field_length;
-        }
-
-        let block_size = block_size
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Missing BGZF BC field"))?;
-        self.file.seek(SeekFrom::Start(address))?;
-        let mut compressed = vec![0_u8; block_size as usize];
-        self.file.read_exact(&mut compressed)?;
-
-        self.block = gzip_decompress(&compressed)?;
-        self.block_address = address;
-        self.block_size = block_size;
+            BlockLoader::Parallel(loader) => loader.load(address)?,
+        };
+        self.block = loaded.bytes;
+        self.block_address = loaded.address;
+        self.block_size = loaded.size;
         self.position = 0;
         Ok(())
     }
+}
+
+fn read_compressed_block(
+    file: &mut File,
+    file_len: u64,
+    address: u64,
+) -> io::Result<(Vec<u8>, u64)> {
+    if address >= file_len {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "BGZF block address is past end of file",
+        ));
+    }
+
+    file.seek(SeekFrom::Start(address))?;
+    let mut header = [0_u8; 12];
+    file.read_exact(&mut header)?;
+    if header[..4] != [31, 139, 8, 4] {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Input is not BGZF-compressed data",
+        ));
+    }
+
+    let extra_length = u16::from_le_bytes(header[10..12].try_into().unwrap()) as usize;
+    let mut extra = vec![0_u8; extra_length];
+    file.read_exact(&mut extra)?;
+
+    let mut position = 0;
+    let mut block_size = None;
+    while position + 4 <= extra.len() {
+        let field_length =
+            u16::from_le_bytes(extra[position + 2..position + 4].try_into().unwrap()) as usize;
+        if position + 4 + field_length > extra.len() {
+            break;
+        }
+        if &extra[position..position + 2] == b"BC" && field_length == 2 {
+            block_size = Some(
+                u16::from_le_bytes(extra[position + 4..position + 6].try_into().unwrap()) as u64
+                    + 1,
+            );
+            break;
+        }
+        position += 4 + field_length;
+    }
+
+    let block_size = block_size
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Missing BGZF BC field"))?;
+    let prefix_len = header.len() + extra.len();
+    let block_len = usize::try_from(block_size)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "BGZF block is too large"))?;
+    if block_len < prefix_len || address.saturating_add(block_size) > file_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Invalid BGZF block size",
+        ));
+    }
+    let mut compressed = Vec::with_capacity(block_len);
+    compressed.extend_from_slice(&header);
+    compressed.extend_from_slice(&extra);
+    compressed.resize(block_len, 0);
+    file.read_exact(&mut compressed[prefix_len..])?;
+    Ok((compressed, block_size))
 }
 
 fn gzip_decompress(block: &[u8]) -> io::Result<Vec<u8>> {

@@ -63,6 +63,7 @@ impl IndexWriter {
         Self::with_limits_and_threads(output_path, TARGET_RECORDS, MAX_RAW_BLOCK_SIZE, threads)
     }
 
+    #[cfg(test)]
     pub(super) fn with_limits(
         output_path: &str,
         target_records: u32,
