@@ -4,7 +4,9 @@ mod indexer;
 
 use crate::bgzf::BgzfReader;
 use crate::ffx::{FfxIndex, FfxRecord};
-use crate::indexer::{DEFAULT_SORT_MEMORY_MIB, build_index_from_fai_gzi, build_index_from_fasta};
+use crate::indexer::{
+    DEFAULT_SORT_MEMORY_MIB, build_index_from_fai_gzi, build_index_from_fasta, default_threads,
+};
 use regex::Regex;
 use std::collections::HashSet;
 use std::env;
@@ -30,6 +32,7 @@ struct FetchArgs {
     invert_match: bool,
     temp_directory: Option<String>,
     sort_memory_bytes: usize,
+    threads: usize,
     ids: Vec<String>,
 }
 
@@ -40,6 +43,7 @@ struct IndexArgs {
     output: Option<String>,
     temp_directory: Option<String>,
     sort_memory_bytes: usize,
+    threads: usize,
 }
 
 fn usage() -> &'static str {
@@ -65,6 +69,7 @@ FETCH OPTIONS:
     --verbose-missing          Print every exact/prefix query with no matches.
     --temp-directory <DIR>     Directory for temporary files if auto-indexing.
     --sort-memory <MiB>        Auto-index sort memory budget. Default: 512
+    --threads <N>              Auto-index worker threads. Default: available CPUs
     -h, --help                 Print this help message.
 
 INDEX OPTIONS:
@@ -74,6 +79,7 @@ INDEX OPTIONS:
     --output <FILE>            Output index. Default: <FASTA>.ffx or <FAI>.ffx
     --temp-directory <DIR>     Directory for external sort temporary files.
     --sort-memory <MiB>        Memory budget before external sort. Default: 512
+    --threads <N>              Index worker threads. Default: available CPUs
     -h, --help                 Print index-specific help.
 
 The .ffx stores full IDs, BGZF virtual offsets, sequence lengths, and line
@@ -97,6 +103,7 @@ OPTIONS:
     --output <FILE>            Output index. Default: <FASTA>.ffx or <FAI>.ffx
     --temp-directory <DIR>     Directory for external sort temporary files.
     --sort-memory <MiB>        Memory budget before external sort. Default: 512
+    --threads <N>              Index worker threads. Default: available CPUs
     -h, --help                 Print this help message.
 
 The --fasta path is pure Rust and does not need samtools indexes. The --fai
@@ -141,6 +148,7 @@ fn parse_fetch_args() -> Result<FetchArgs, String> {
     let mut invert_match = false;
     let mut temp_directory = None;
     let mut sort_memory_mib = DEFAULT_SORT_MEMORY_MIB;
+    let mut threads = default_threads();
     let mut ids = Vec::new();
     let mut arguments = env::args().skip(2);
 
@@ -171,6 +179,17 @@ fn parse_fetch_args() -> Result<FetchArgs, String> {
                     return Err("--sort-memory must be greater than zero".to_string());
                 }
             }
+            "--threads" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "--threads needs a value".to_string())?;
+                threads = value
+                    .parse()
+                    .map_err(|_| format!("Invalid --threads value: {value}"))?;
+                if threads == 0 {
+                    return Err("--threads must be greater than zero".to_string());
+                }
+            }
             "--full-id" => id_mode = IdMode::Exact,
             "-h" | "--help" => return Err(usage().to_string()),
             _ if argument.starts_with('-') => {
@@ -195,6 +214,7 @@ fn parse_fetch_args() -> Result<FetchArgs, String> {
         invert_match,
         temp_directory,
         sort_memory_bytes,
+        threads,
         ids,
     })
 }
@@ -206,6 +226,7 @@ fn parse_index_args() -> Result<IndexArgs, String> {
     let mut output = None;
     let mut temp_directory = None;
     let mut sort_memory_mib = DEFAULT_SORT_MEMORY_MIB;
+    let mut threads = default_threads();
     let mut arguments = env::args().skip(2);
 
     while let Some(argument) = arguments.next() {
@@ -224,6 +245,17 @@ fn parse_index_args() -> Result<IndexArgs, String> {
                     .map_err(|_| format!("Invalid --sort-memory value: {value}"))?;
                 if sort_memory_mib == 0 {
                     return Err("--sort-memory must be greater than zero".to_string());
+                }
+            }
+            "--threads" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "--threads needs a value".to_string())?;
+                threads = value
+                    .parse()
+                    .map_err(|_| format!("Invalid --threads value: {value}"))?;
+                if threads == 0 {
+                    return Err("--threads must be greater than zero".to_string());
                 }
             }
             "-h" | "--help" => {
@@ -249,6 +281,7 @@ fn parse_index_args() -> Result<IndexArgs, String> {
         output,
         temp_directory,
         sort_memory_bytes,
+        threads,
     })
 }
 
@@ -315,6 +348,7 @@ fn run_index_command() -> Result<(), Box<dyn Error>> {
                 &output,
                 arguments.temp_directory.as_deref(),
                 arguments.sort_memory_bytes,
+                arguments.threads,
             )?;
         }
         (Some(_), None) | (None, Some(_)) => {
@@ -330,6 +364,7 @@ fn run_index_command() -> Result<(), Box<dyn Error>> {
                 &output,
                 arguments.temp_directory.as_deref(),
                 arguments.sort_memory_bytes,
+                arguments.threads,
             )?;
         }
     }
@@ -359,6 +394,7 @@ fn run_fetch_command() -> Result<(), Box<dyn Error>> {
             &arguments.ffx,
             arguments.temp_directory.as_deref(),
             arguments.sort_memory_bytes,
+            arguments.threads,
         )?;
     }
 

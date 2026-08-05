@@ -212,6 +212,34 @@ mod tests {
     }
 
     #[test]
+    fn parallel_writer_matches_serial_output() {
+        let serial_output = path("serial");
+        let parallel_output = path("parallel");
+        let records = (0..20)
+            .map(|value| record(&format!("id-{value:03}"), value))
+            .collect::<Vec<_>>();
+
+        let mut serial =
+            IndexWriter::with_limits(serial_output.to_str().unwrap(), 2, 1024).unwrap();
+        let mut parallel =
+            IndexWriter::with_limits_and_threads(parallel_output.to_str().unwrap(), 2, 1024, 4)
+                .unwrap();
+        for value in records {
+            serial.add(value.clone()).unwrap();
+            parallel.add(value).unwrap();
+        }
+        serial.finish().unwrap();
+        parallel.finish().unwrap();
+
+        assert_eq!(
+            fs::read(&serial_output).unwrap(),
+            fs::read(&parallel_output).unwrap()
+        );
+        fs::remove_file(serial_output).unwrap();
+        fs::remove_file(parallel_output).unwrap();
+    }
+
+    #[test]
     fn very_long_id_can_exceed_the_normal_block_target() {
         let output = path("long-id");
         let id = "x".repeat(8_192);
