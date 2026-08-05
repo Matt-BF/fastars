@@ -77,7 +77,9 @@ fn parallel_reader_matches_serial_across_block_boundaries() {
     fs::write(&path, contents).unwrap();
 
     let serial = read_all_lines(BgzfReader::new(&path).unwrap()).unwrap();
+    let single_threaded = read_all_lines(BgzfReader::with_threads(&path, 1).unwrap()).unwrap();
     let parallel = read_all_lines(BgzfReader::with_threads(&path, 4).unwrap()).unwrap();
+    assert_eq!(single_threaded, serial);
     assert_eq!(parallel, serial);
     assert_eq!(
         parallel
@@ -91,6 +93,18 @@ fn parallel_reader_matches_serial_across_block_boundaries() {
             b"TT\n".as_slice(),
         ]
     );
+
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn reader_returns_final_line_without_newline() {
+    let path = test_path();
+    fs::write(&path, uncompressed_bgzf_block(b">alpha\nACGT")).unwrap();
+
+    let lines = read_all_lines(BgzfReader::with_threads(&path, 2).unwrap()).unwrap();
+    assert_eq!(lines[0].1, b">alpha\n");
+    assert_eq!(lines[1].1, b"ACGT");
 
     fs::remove_file(path).unwrap();
 }

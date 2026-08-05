@@ -39,3 +39,21 @@ hyperfine --warmup 1 \
     --threads 32 \
     --sort-memory 64'
 ```
+
+## BGZF line-scanning result
+
+Replacing byte-at-a-time line reads with block-slice scans produced the
+following local results with `--threads 32 --sort-memory 512`. Wall time varies
+with the shared filesystem, while user CPU is stable.
+
+| Reader | Wall time (s) | User CPU (s) | Peak RSS (KiB) |
+| --- | ---: | ---: | ---: |
+| Byte-at-a-time | 105.18 | 54.33 | 110,252 |
+| Byte-at-a-time | 123.81 | 55.32 | 103,996 |
+| Byte-at-a-time, post-control | 59.15 | 54.53 | 120,732 |
+| Block-slice scan | 39.67 | 37.68 | 106,796 |
+| Block-slice scan | 37.64 | 37.78 | 106,404 |
+
+The block-slice implementation reduced user CPU by about 31%. Against the
+immediately following pre-change control, elapsed time fell by about 35%. The
+generated `.ffx` files were byte-identical.

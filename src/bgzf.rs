@@ -102,16 +102,27 @@ impl BgzfReader {
     }
 
     pub fn read_line(&mut self) -> io::Result<Option<BgzfLine>> {
-        let Some((start_virtual, first)) = self.next_byte_with_offset()? else {
+        if !self.ensure_block()? {
             return Ok(None);
-        };
-        let mut bytes = vec![first];
-        while *bytes.last().unwrap() != b'\n' {
-            let Some((_, byte)) = self.next_byte_with_offset()? else {
-                break;
-            };
-            bytes.push(byte);
         }
+        let start_virtual = (self.block_address << 16) | self.position as u64;
+        let mut bytes = Vec::new();
+
+        loop {
+            if !self.ensure_block()? {
+                break;
+            }
+            let remaining = &self.block[self.position..];
+            if let Some(newline) = memchr::memchr(b'\n', remaining) {
+                let end = self.position + newline + 1;
+                bytes.extend_from_slice(&self.block[self.position..end]);
+                self.position = end;
+                break;
+            }
+            bytes.extend_from_slice(remaining);
+            self.position = self.block.len();
+        }
+
         Ok(Some(BgzfLine {
             start_virtual,
             bytes,
@@ -161,17 +172,6 @@ impl BgzfReader {
             }
         }
         Ok(sequence)
-    }
-
-    fn next_byte_with_offset(&mut self) -> io::Result<Option<(u64, u8)>> {
-        if !self.ensure_block()? {
-            return Ok(None);
-        }
-
-        let virtual_offset = (self.block_address << 16) | self.position as u64;
-        let byte = self.block[self.position];
-        self.position += 1;
-        Ok(Some((virtual_offset, byte)))
     }
 
     fn read_raw(&mut self, count: usize) -> io::Result<Vec<u8>> {
