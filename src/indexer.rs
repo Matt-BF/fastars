@@ -1,10 +1,10 @@
 use crate::bgzf::{BgzfLine, BgzfReader};
-use crate::ffx::{IndexRecord, IndexWriter, read_u64};
+use crate::ffx::{IndexRecord, IndexStats, IndexWriter, read_u64};
 use std::error::Error;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 #[derive(Clone, Copy)]
 struct RecordMetadata {
@@ -215,7 +215,6 @@ struct IndexBuilder {
     last_id: Option<String>,
     input_is_sorted: bool,
     sort_input_path: PathBuf,
-    sort_output_path: PathBuf,
     temp_directory: Option<PathBuf>,
 }
 
@@ -231,7 +230,6 @@ impl IndexBuilder {
 
         let pid = std::process::id();
         let sort_input_path = temp_root.join(format!("fastars-{pid}.sort-input.tmp"));
-        let sort_output_path = temp_root.join(format!("fastars-{pid}.sort-output.tmp"));
 
         Ok(Self {
             sort_input: BufWriter::new(File::create(&sort_input_path)?),
@@ -239,7 +237,6 @@ impl IndexBuilder {
             last_id: None,
             input_is_sorted: true,
             sort_input_path,
-            sort_output_path,
             temp_directory: temp_directory.map(PathBuf::from),
         })
     }
@@ -280,9 +277,10 @@ impl IndexBuilder {
     fn finish(mut self, output_path: &str) -> Result<(), Box<dyn Error>> {
         self.sort_input.flush()?;
 
-        let sorted_path = if self.input_is_sorted {
+        let stats = if self.input_is_sorted {
             eprintln!("[INFO] input IDs are already sorted; skipping external sort");
-            &self.sort_input_path
+            let sorted = BufReader::new(File::open(&self.sort_input_path)?);
+            write_index(sorted, output_path, self.record_count)?
         } else {
             let mut sort = Command::new("sort");
             sort.env("LC_ALL", "C")
@@ -293,33 +291,21 @@ impl IndexBuilder {
             if let Some(directory) = &self.temp_directory {
                 sort.arg("-T").arg(directory);
             }
-            let status = sort
+            let mut child = sort
                 .arg(&self.sort_input_path)
-                .arg("-o")
-                .arg(&self.sort_output_path)
-                .status()?;
+                .stdout(Stdio::piped())
+                .spawn()?;
+            let stdout = child
+                .stdout
+                .take()
+                .ok_or_else(|| io::Error::other("Could not read sort output"))?;
+            let write_result = write_index(BufReader::new(stdout), output_path, self.record_count);
+            let status = child.wait()?;
             if !status.success() {
                 return Err(io::Error::other("sort failed while building .ffx").into());
             }
-            &self.sort_output_path
+            write_result?
         };
-
-        let sorted = BufReader::new(File::open(sorted_path)?);
-        let mut writer = IndexWriter::new(output_path)?;
-        let mut ordered_count = 0;
-        for line in sorted.lines() {
-            writer.add(parse_sorted_record(&line?)?)?;
-            ordered_count += 1;
-        }
-
-        if ordered_count != self.record_count {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Sorted index record count does not match scanned FASTA records",
-            )
-            .into());
-        }
-        let stats = writer.finish()?;
         let ratio = if stats.raw_block_bytes == 0 {
             0.0
         } else {
@@ -338,10 +324,29 @@ impl IndexBuilder {
 
 impl Drop for IndexBuilder {
     fn drop(&mut self) {
-        for path in [&self.sort_input_path, &self.sort_output_path] {
-            let _ = fs::remove_file(path);
-        }
+        let _ = fs::remove_file(&self.sort_input_path);
     }
+}
+
+fn write_index<R: BufRead>(
+    sorted: R,
+    output_path: &str,
+    expected_records: u64,
+) -> io::Result<IndexStats> {
+    let mut writer = IndexWriter::new(output_path)?;
+    let mut ordered_count = 0;
+    for line in sorted.lines() {
+        writer.add(parse_sorted_record(&line?)?)?;
+        ordered_count += 1;
+    }
+
+    if ordered_count != expected_records {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Sorted index record count does not match scanned FASTA records",
+        ));
+    }
+    writer.finish()
 }
 
 fn parse_sorted_record(line: &str) -> io::Result<IndexRecord> {
@@ -496,10 +501,8 @@ mod tests {
         let output = directory.join("output.ffx");
         let builder = IndexBuilder::new(output.to_str().unwrap(), directory.to_str()).unwrap();
         let input = builder.sort_input_path.clone();
-        let sorted = builder.sort_output_path.clone();
         drop(builder);
         assert!(!input.exists());
-        assert!(!sorted.exists());
         fs::remove_dir(directory).unwrap();
     }
 }

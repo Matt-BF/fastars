@@ -11,7 +11,7 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
-pub(crate) use writer::IndexWriter;
+pub(crate) use writer::{IndexStats, IndexWriter};
 
 const CACHE_BLOCKS: usize = 4;
 
