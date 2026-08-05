@@ -1,6 +1,6 @@
 # fastars
 
-`fastars` fetches records from large BGZF-compressed FASTA files using a
+`fastars` fetches records from large BGZF-compressed or uncompressed FASTA files using a
 self-contained `.ffx` index. It writes FASTA (nucleotide and protein) records
 to standard output, so it fits directly into shell pipelines.
 
@@ -10,7 +10,8 @@ Use `fastars index` to build an index and `fastars fetch` to retrieve records.
 
 - Rust and Cargo to build the program.
 - The system zstd library and `pkg-config` to build compressed index support.
-- A BGZF-compressed FASTA (`.bgz`), not plain gzip or zstd compression.
+- A BGZF-compressed (`.bgz`) or uncompressed FASTA. Plain gzip and zstd
+  compression are not supported.
 - The system `sort` command to build an `.ffx` index.
 
 Fetch does not require `.fai` or `.gzi` files. Those files are only optional
@@ -30,7 +31,7 @@ target/release/fastars
 
 ## Build an index
 
-The preferred path scans the BGZF FASTA directly:
+The preferred path scans the BGZF-compressed or uncompressed FASTA directly:
 
 ```bash
 fastars index --fasta sequences.fna.bgz

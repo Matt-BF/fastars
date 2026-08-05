@@ -1,8 +1,9 @@
 mod bgzf;
+mod fasta;
 mod ffx;
 mod indexer;
 
-use crate::bgzf::BgzfReader;
+use crate::fasta::FastaReader;
 use crate::ffx::{FfxIndex, FfxRecord};
 use crate::indexer::{
     DEFAULT_SORT_MEMORY_MIB, build_index_from_fai_gzi, build_index_from_fasta, default_threads,
@@ -47,7 +48,7 @@ struct IndexArgs {
 }
 
 fn usage() -> &'static str {
-    r#"fastars — fast random retrieval from BGZF-compressed FASTA files
+    r#"fastars — fast random retrieval from BGZF-compressed or plain FASTA files
 
 USAGE:
     fastars fetch --fasta <FASTA.bgz> [OPTIONS] [ID ...]
@@ -59,7 +60,7 @@ COMMANDS:
     index    Build a compressed, self-contained .ffx index.
 
 FETCH OPTIONS:
-    --fasta <FILE>             BGZF-compressed FASTA to read. Required.
+    --fasta <FILE>             BGZF-compressed or plain FASTA. Required.
     --ffx <FILE>               Self-contained index. Default: <FASTA>.ffx
     -f, --ids-file <FILE>      Read one query ID per line.
     -m, --id-mode <MODE>       Query mode for IDs: exact or prefix. Default: exact
@@ -73,7 +74,7 @@ FETCH OPTIONS:
     -h, --help                 Print this help message.
 
 INDEX OPTIONS:
-    --fasta <FILE>             Build .ffx by scanning a BGZF FASTA directly.
+    --fasta <FILE>             Build .ffx by scanning a BGZF or plain FASTA.
     --fai <FILE>               Optional build source: existing FASTA .fai.
     --gzi <FILE>               Required with --fai to convert offsets once.
     --output <FILE>            Output index. Default: <FASTA>.ffx or <FAI>.ffx
@@ -82,8 +83,8 @@ INDEX OPTIONS:
     --threads <N>              Index worker threads. Default: available CPUs
     -h, --help                 Print index-specific help.
 
-The .ffx stores full IDs, BGZF virtual offsets, sequence lengths, and line
-layout. Fetching needs only the BGZF FASTA and .ffx; .fai/.gzi files are not
+The .ffx stores full IDs, FASTA offsets, sequence lengths, and line layout.
+Fetching needs only the FASTA and .ffx; .fai/.gzi files are not
 read during fetch. Use --id-mode prefix for prefix queries or --id-regexp for
 regular-expression queries.
 "#
@@ -97,7 +98,7 @@ USAGE:
     fastars index --fai <FASTA.bgz.fai> --gzi <FASTA.bgz.gzi> [OPTIONS]
 
 OPTIONS:
-    --fasta <FILE>             Build by scanning a BGZF FASTA directly.
+    --fasta <FILE>             Build by scanning a BGZF or plain FASTA.
     --fai <FILE>               Build from an existing .fai file.
     --gzi <FILE>               BGZF .gzi file. Required with --fai.
     --output <FILE>            Output index. Default: <FASTA>.ffx or <FAI>.ffx
@@ -315,11 +316,11 @@ fn add_records(records: Vec<FfxRecord>, seen: &mut HashSet<u64>, output: &mut Ve
 }
 
 fn write_record(
-    reader: &mut BgzfReader,
+    reader: &mut FastaReader,
     output: &mut BufWriter<io::StdoutLock<'_>>,
     record: &FfxRecord,
 ) -> io::Result<()> {
-    reader.seek_virtual(record.virtual_offset)?;
+    reader.seek(record.virtual_offset)?;
     let sequence =
         reader.read_sequence(record.sequence_length, record.line_bases, record.line_width)?;
     writeln!(output, ">{}", record.full_id)?;
@@ -433,7 +434,7 @@ fn run_fetch_command() -> Result<(), Box<dyn Error>> {
         records.sort_by_key(|record| record.virtual_offset);
     }
 
-    let mut reader = BgzfReader::new(&arguments.fasta)?;
+    let mut reader = FastaReader::new(&arguments.fasta)?;
     let stdout = io::stdout();
     let mut output = BufWriter::new(stdout.lock());
     for record in &records {

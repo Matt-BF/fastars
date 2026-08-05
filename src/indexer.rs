@@ -1,4 +1,4 @@
-use crate::bgzf::{BgzfLine, BgzfReader};
+use crate::fasta::{FastaLine, FastaReader};
 use crate::ffx::{IndexRecord, IndexStats, IndexWriter, read_u64};
 use std::error::Error;
 use std::fs::{self, File};
@@ -32,7 +32,7 @@ pub fn build_index_from_fasta(
     sort_memory_bytes: usize,
     threads: usize,
 ) -> Result<(), Box<dyn Error>> {
-    let mut reader = BgzfReader::with_threads(fasta_path, threads)?;
+    let mut reader = FastaReader::with_threads(fasta_path, threads)?;
     let mut builder = IndexBuilder::new(output_path, temp_directory, sort_memory_bytes, threads)?;
     let mut pending_header = None;
 
@@ -91,7 +91,9 @@ pub fn build_index_from_fai_gzi(
     Ok(())
 }
 
-fn read_record_metadata(reader: &mut BgzfReader) -> io::Result<(RecordMetadata, Option<BgzfLine>)> {
+fn read_record_metadata(
+    reader: &mut FastaReader,
+) -> io::Result<(RecordMetadata, Option<FastaLine>)> {
     let mut sequence_offset = None;
     let mut sequence_length = 0;
     let mut line_bases = 0;
@@ -124,7 +126,7 @@ fn read_record_metadata(reader: &mut BgzfReader) -> io::Result<(RecordMetadata, 
         }
 
         if sequence_offset.is_none() {
-            sequence_offset = Some(line.start_virtual);
+            sequence_offset = Some(line.offset);
             line_bases = bases;
             line_width = width;
         }
@@ -590,6 +592,35 @@ mod tests {
         assert_eq!(index.find_prefix("z").unwrap()[0].virtual_offset, 30);
 
         for path in [fai, gzi, output] {
+            fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn plain_fasta_builder_indexes_byte_offsets() {
+        let fasta = test_path("input.fna");
+        let output = test_path("plain-output.ffx");
+        fs::write(&fasta, b">zeta description\nACGT\nAC\n>alpha\nTTT\n").unwrap();
+
+        build_index_from_fasta(
+            fasta.to_str().unwrap(),
+            output.to_str().unwrap(),
+            None,
+            usize::MAX,
+            4,
+        )
+        .unwrap();
+
+        let mut index = FfxIndex::open(output.to_str().unwrap()).unwrap();
+        let alpha = index.find_exact("alpha").unwrap().pop().unwrap();
+        let zeta = index.find_exact("zeta").unwrap().pop().unwrap();
+        assert_eq!(alpha.virtual_offset, 33);
+        assert_eq!(alpha.sequence_length, 3);
+        assert_eq!(zeta.virtual_offset, 18);
+        assert_eq!(zeta.sequence_length, 6);
+        assert_eq!((zeta.line_bases, zeta.line_width), (4, 5));
+
+        for path in [fasta, output] {
             fs::remove_file(path).unwrap();
         }
     }
