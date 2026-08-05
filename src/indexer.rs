@@ -3,8 +3,11 @@ use crate::ffx::{IndexRecord, IndexStats, IndexWriter, read_u64};
 use std::error::Error;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, BufWriter, Seek, SeekFrom, Write};
+use std::mem;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+
+pub const DEFAULT_SORT_MEMORY_MIB: usize = 512;
 
 #[derive(Clone, Copy)]
 struct RecordMetadata {
@@ -18,9 +21,10 @@ pub fn build_index_from_fasta(
     fasta_path: &str,
     output_path: &str,
     temp_directory: Option<&str>,
+    sort_memory_bytes: usize,
 ) -> Result<(), Box<dyn Error>> {
     let mut reader = BgzfReader::new(fasta_path)?;
-    let mut builder = IndexBuilder::new(output_path, temp_directory)?;
+    let mut builder = IndexBuilder::new(output_path, temp_directory, sort_memory_bytes)?;
     let mut pending_header = None;
 
     loop {
@@ -55,11 +59,12 @@ pub fn build_index_from_fai_gzi(
     gzi_path: &str,
     output_path: &str,
     temp_directory: Option<&str>,
+    sort_memory_bytes: usize,
 ) -> Result<(), Box<dyn Error>> {
     let mut gzi = File::open(gzi_path)?;
     let gzi_count = read_gzi_count(&mut gzi)?;
     let reader = BufReader::new(File::open(fai_path)?);
-    let mut builder = IndexBuilder::new(output_path, temp_directory)?;
+    let mut builder = IndexBuilder::new(output_path, temp_directory, sort_memory_bytes)?;
 
     for line in reader.lines() {
         let line = line?;
@@ -210,7 +215,10 @@ fn parse_fai_record(line: &str) -> io::Result<(String, RecordMetadata)> {
 }
 
 struct IndexBuilder {
-    sort_input: BufWriter<File>,
+    records: Vec<IndexRecord>,
+    buffered_bytes: usize,
+    sort_memory_bytes: usize,
+    sort_input: Option<BufWriter<File>>,
     record_count: u64,
     last_id: Option<String>,
     input_is_sorted: bool,
@@ -219,7 +227,14 @@ struct IndexBuilder {
 }
 
 impl IndexBuilder {
-    fn new(output_path: &str, temp_directory: Option<&str>) -> io::Result<Self> {
+    fn new(
+        output_path: &str,
+        temp_directory: Option<&str>,
+        sort_memory_bytes: usize,
+    ) -> io::Result<Self> {
+        if sort_memory_bytes == 0 {
+            return Err(io::Error::other("Sort memory must be greater than zero"));
+        }
         let output = Path::new(output_path);
         let temp_root = temp_directory
             .map(PathBuf::from)
@@ -232,7 +247,10 @@ impl IndexBuilder {
         let sort_input_path = temp_root.join(format!("fastars-{pid}.sort-input.tmp"));
 
         Ok(Self {
-            sort_input: BufWriter::new(File::create(&sort_input_path)?),
+            records: Vec::new(),
+            buffered_bytes: 0,
+            sort_memory_bytes,
+            sort_input: None,
             record_count: 0,
             last_id: None,
             input_is_sorted: true,
@@ -249,15 +267,6 @@ impl IndexBuilder {
             ));
         }
 
-        writeln!(
-            self.sort_input,
-            "{full_id}\t{}\t{}\t{}\t{}",
-            metadata.virtual_offset,
-            metadata.sequence_length,
-            metadata.line_bases,
-            metadata.line_width
-        )?;
-
         if self
             .last_id
             .as_deref()
@@ -267,6 +276,29 @@ impl IndexBuilder {
         }
         self.last_id = Some(full_id.to_string());
 
+        let record = IndexRecord {
+            full_id: full_id.to_string(),
+            virtual_offset: metadata.virtual_offset,
+            sequence_length: metadata.sequence_length,
+            line_bases: metadata.line_bases,
+            line_width: metadata.line_width,
+        };
+        if let Some(sort_input) = &mut self.sort_input {
+            write_sort_record(sort_input, &record)?;
+        } else {
+            let record_bytes = sort_memory_cost(&record);
+            if self
+                .buffered_bytes
+                .checked_add(record_bytes)
+                .is_some_and(|total| total <= self.sort_memory_bytes)
+            {
+                self.buffered_bytes += record_bytes;
+                self.records.push(record);
+            } else {
+                self.spill_records(record)?;
+            }
+        }
+
         self.record_count = self
             .record_count
             .checked_add(1)
@@ -275,51 +307,101 @@ impl IndexBuilder {
     }
 
     fn finish(mut self, output_path: &str) -> Result<(), Box<dyn Error>> {
-        self.sort_input.flush()?;
-
-        let stats = if self.input_is_sorted {
-            eprintln!("[INFO] input IDs are already sorted; skipping external sort");
-            let sorted = BufReader::new(File::open(&self.sort_input_path)?);
-            write_index(sorted, output_path, self.record_count)?
+        let stats = if let Some(mut sort_input) = self.sort_input.take() {
+            sort_input.flush()?;
+            drop(sort_input);
+            self.write_spilled_index(output_path)?
         } else {
-            let mut sort = Command::new("sort");
-            sort.env("LC_ALL", "C")
-                .arg("-t")
-                .arg("\t")
-                .arg("-k1,1")
-                .arg("-s");
-            if let Some(directory) = &self.temp_directory {
-                sort.arg("-T").arg(directory);
+            if !self.input_is_sorted {
+                self.records
+                    .sort_by(|left, right| left.full_id.cmp(&right.full_id));
+            } else {
+                eprintln!("[INFO] input IDs are already sorted; skipping sort");
             }
-            let mut child = sort
-                .arg(&self.sort_input_path)
-                .stdout(Stdio::piped())
-                .spawn()?;
-            let stdout = child
-                .stdout
-                .take()
-                .ok_or_else(|| io::Error::other("Could not read sort output"))?;
-            let write_result = write_index(BufReader::new(stdout), output_path, self.record_count);
-            let status = child.wait()?;
-            if !status.success() {
-                return Err(io::Error::other("sort failed while building .ffx").into());
-            }
-            write_result?
+            let records = mem::take(&mut self.records);
+            write_record_index(records, output_path, self.record_count)?
         };
-        let ratio = if stats.raw_block_bytes == 0 {
-            0.0
-        } else {
-            stats.stored_block_bytes as f64 / stats.raw_block_bytes as f64
-        };
-        eprintln!(
-            "[INFO] indexed {} records in {} blocks; {} bytes on disk (blocks compressed to {:.1}%)",
-            stats.record_count,
-            stats.block_count,
-            stats.file_size,
-            ratio * 100.0
-        );
+        report_stats(&stats);
         Ok(())
     }
+
+    fn spill_records(&mut self, record: IndexRecord) -> io::Result<()> {
+        eprintln!("[INFO] sort memory limit reached; spilling records for external sort");
+        let mut sort_input = BufWriter::new(File::create(&self.sort_input_path)?);
+        for buffered in self.records.drain(..) {
+            write_sort_record(&mut sort_input, &buffered)?;
+        }
+        write_sort_record(&mut sort_input, &record)?;
+        self.buffered_bytes = 0;
+        self.sort_input = Some(sort_input);
+        Ok(())
+    }
+
+    fn write_spilled_index(&self, output_path: &str) -> Result<IndexStats, Box<dyn Error>> {
+        if self.input_is_sorted {
+            eprintln!("[INFO] input IDs are already sorted; skipping external sort");
+            let sorted = BufReader::new(File::open(&self.sort_input_path)?);
+            return Ok(write_text_index(sorted, output_path, self.record_count)?);
+        }
+
+        let mut sort = Command::new("sort");
+        sort.env("LC_ALL", "C")
+            .arg("-t")
+            .arg("\t")
+            .arg("-k1,1")
+            .arg("-s");
+        if let Some(directory) = &self.temp_directory {
+            sort.arg("-T").arg(directory);
+        }
+        let mut child = sort
+            .arg(&self.sort_input_path)
+            .stdout(Stdio::piped())
+            .spawn()?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| io::Error::other("Could not read sort output"))?;
+        let write_result = write_text_index(BufReader::new(stdout), output_path, self.record_count);
+        let status = child.wait()?;
+        if !status.success() {
+            return Err(io::Error::other("sort failed while building .ffx").into());
+        }
+        Ok(write_result?)
+    }
+}
+
+fn sort_memory_cost(record: &IndexRecord) -> usize {
+    record
+        .full_id
+        .len()
+        .saturating_add(3 * mem::size_of::<IndexRecord>())
+}
+
+fn write_sort_record<W: Write>(output: &mut W, record: &IndexRecord) -> io::Result<()> {
+    writeln!(
+        output,
+        "{}\t{}\t{}\t{}\t{}",
+        record.full_id,
+        record.virtual_offset,
+        record.sequence_length,
+        record.line_bases,
+        record.line_width
+    )
+}
+
+fn report_stats(stats: &IndexStats) {
+    let ratio = if stats.raw_block_bytes == 0 {
+        0.0
+    } else {
+        stats.stored_block_bytes as f64 / stats.raw_block_bytes as f64
+    };
+    eprintln!(
+        "[INFO] indexed {} records in {} blocks; {} bytes on disk (blocks compressed to {:.1}%)",
+        stats.record_count,
+        stats.block_count,
+        stats.file_size,
+        ratio * 100.0
+    );
 }
 
 impl Drop for IndexBuilder {
@@ -328,7 +410,7 @@ impl Drop for IndexBuilder {
     }
 }
 
-fn write_index<R: BufRead>(
+fn write_text_index<R: BufRead>(
     sorted: R,
     output_path: &str,
     expected_records: u64,
@@ -345,6 +427,24 @@ fn write_index<R: BufRead>(
             io::ErrorKind::InvalidData,
             "Sorted index record count does not match scanned FASTA records",
         ));
+    }
+    writer.finish()
+}
+
+fn write_record_index(
+    records: Vec<IndexRecord>,
+    output_path: &str,
+    expected_records: u64,
+) -> io::Result<IndexStats> {
+    if records.len() as u64 != expected_records {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Buffered index record count does not match scanned FASTA records",
+        ));
+    }
+    let mut writer = IndexWriter::new(output_path)?;
+    for record in records {
+        writer.add(record)?;
     }
     writer.finish()
 }
@@ -450,6 +550,7 @@ mod tests {
             gzi.to_str().unwrap(),
             output.to_str().unwrap(),
             None,
+            1,
         )
         .unwrap();
 
@@ -480,7 +581,8 @@ mod tests {
             line_bases: 1,
             line_width: 2,
         };
-        let mut builder = IndexBuilder::new(output.to_str().unwrap(), directory.to_str()).unwrap();
+        let mut builder =
+            IndexBuilder::new(output.to_str().unwrap(), directory.to_str(), usize::MAX).unwrap();
 
         builder.add_record("alpha", metadata).unwrap();
         builder.add_record("alpha", metadata).unwrap();
@@ -495,11 +597,40 @@ mod tests {
     }
 
     #[test]
+    fn in_memory_sort_preserves_duplicate_input_order() {
+        let output = test_path("memory-sort.ffx");
+        let metadata = |virtual_offset| RecordMetadata {
+            virtual_offset,
+            sequence_length: 1,
+            line_bases: 1,
+            line_width: 2,
+        };
+        let mut builder = IndexBuilder::new(output.to_str().unwrap(), None, usize::MAX).unwrap();
+        builder.add_record("zeta", metadata(30)).unwrap();
+        builder.add_record("duplicate", metadata(20)).unwrap();
+        builder.add_record("duplicate", metadata(10)).unwrap();
+        builder.add_record("alpha", metadata(0)).unwrap();
+        builder.finish(output.to_str().unwrap()).unwrap();
+
+        let mut index = FfxIndex::open(output.to_str().unwrap()).unwrap();
+        let offsets = index
+            .find_exact("duplicate")
+            .unwrap()
+            .into_iter()
+            .map(|record| record.virtual_offset)
+            .collect::<Vec<_>>();
+        assert_eq!(offsets, vec![20, 10]);
+
+        fs::remove_file(output).unwrap();
+    }
+
+    #[test]
     fn dropping_builder_removes_temporary_files() {
         let directory = test_path("temporary-directory");
         fs::create_dir(&directory).unwrap();
         let output = directory.join("output.ffx");
-        let builder = IndexBuilder::new(output.to_str().unwrap(), directory.to_str()).unwrap();
+        let builder =
+            IndexBuilder::new(output.to_str().unwrap(), directory.to_str(), usize::MAX).unwrap();
         let input = builder.sort_input_path.clone();
         drop(builder);
         assert!(!input.exists());

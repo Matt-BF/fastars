@@ -36,6 +36,10 @@ The preferred path scans the BGZF FASTA directly:
 fastars index --fasta sequences.fna.bgz
 ```
 
+Up to 512 MiB is used for an in-memory ID sort by default. Set
+`--sort-memory <MiB>` to change the budget; larger indexes automatically fall
+back to an external sort in `--temp-directory`.
+
 This writes:
 
 ```text
