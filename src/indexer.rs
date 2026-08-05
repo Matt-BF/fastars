@@ -212,6 +212,8 @@ fn parse_fai_record(line: &str) -> io::Result<(String, RecordMetadata)> {
 struct IndexBuilder {
     sort_input: BufWriter<File>,
     record_count: u64,
+    last_id: Option<String>,
+    input_is_sorted: bool,
     sort_input_path: PathBuf,
     sort_output_path: PathBuf,
     temp_directory: Option<PathBuf>,
@@ -234,6 +236,8 @@ impl IndexBuilder {
         Ok(Self {
             sort_input: BufWriter::new(File::create(&sort_input_path)?),
             record_count: 0,
+            last_id: None,
+            input_is_sorted: true,
             sort_input_path,
             sort_output_path,
             temp_directory: temp_directory.map(PathBuf::from),
@@ -257,6 +261,15 @@ impl IndexBuilder {
             metadata.line_width
         )?;
 
+        if self
+            .last_id
+            .as_deref()
+            .is_some_and(|previous| previous > full_id)
+        {
+            self.input_is_sorted = false;
+        }
+        self.last_id = Some(full_id.to_string());
+
         self.record_count = self
             .record_count
             .checked_add(1)
@@ -267,25 +280,31 @@ impl IndexBuilder {
     fn finish(mut self, output_path: &str) -> Result<(), Box<dyn Error>> {
         self.sort_input.flush()?;
 
-        let mut sort = Command::new("sort");
-        sort.env("LC_ALL", "C")
-            .arg("-t")
-            .arg("\t")
-            .arg("-k1,1")
-            .arg("-s");
-        if let Some(directory) = &self.temp_directory {
-            sort.arg("-T").arg(directory);
-        }
-        let status = sort
-            .arg(&self.sort_input_path)
-            .arg("-o")
-            .arg(&self.sort_output_path)
-            .status()?;
-        if !status.success() {
-            return Err(io::Error::other("sort failed while building .ffx").into());
-        }
+        let sorted_path = if self.input_is_sorted {
+            eprintln!("[INFO] input IDs are already sorted; skipping external sort");
+            &self.sort_input_path
+        } else {
+            let mut sort = Command::new("sort");
+            sort.env("LC_ALL", "C")
+                .arg("-t")
+                .arg("\t")
+                .arg("-k1,1")
+                .arg("-s");
+            if let Some(directory) = &self.temp_directory {
+                sort.arg("-T").arg(directory);
+            }
+            let status = sort
+                .arg(&self.sort_input_path)
+                .arg("-o")
+                .arg(&self.sort_output_path)
+                .status()?;
+            if !status.success() {
+                return Err(io::Error::other("sort failed while building .ffx").into());
+            }
+            &self.sort_output_path
+        };
 
-        let sorted = BufReader::new(File::open(&self.sort_output_path)?);
+        let sorted = BufReader::new(File::open(sorted_path)?);
         let mut writer = IndexWriter::new(output_path)?;
         let mut ordered_count = 0;
         for line in sorted.lines() {
@@ -443,6 +462,31 @@ mod tests {
     fn sorted_row_parser_rejects_extra_fields() {
         assert!(parse_sorted_record("id\t1\t2\t3\t4\textra").is_err());
         assert!(parse_sorted_record("id\t1\t2\t3").is_err());
+    }
+
+    #[test]
+    fn builder_detects_sorted_and_unsorted_ids() {
+        let directory = test_path("ordering-directory");
+        fs::create_dir(&directory).unwrap();
+        let output = directory.join("output.ffx");
+        let metadata = RecordMetadata {
+            virtual_offset: 0,
+            sequence_length: 1,
+            line_bases: 1,
+            line_width: 2,
+        };
+        let mut builder = IndexBuilder::new(output.to_str().unwrap(), directory.to_str()).unwrap();
+
+        builder.add_record("alpha", metadata).unwrap();
+        builder.add_record("alpha", metadata).unwrap();
+        builder.add_record("zeta", metadata).unwrap();
+        assert!(builder.input_is_sorted);
+
+        builder.add_record("beta", metadata).unwrap();
+        assert!(!builder.input_is_sorted);
+
+        drop(builder);
+        fs::remove_dir(directory).unwrap();
     }
 
     #[test]
