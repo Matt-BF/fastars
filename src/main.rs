@@ -2,6 +2,7 @@ mod bgzf;
 mod fasta;
 mod ffx;
 mod indexer;
+mod progress;
 
 use crate::fasta::FastaReader;
 use crate::ffx::{FfxIndex, FfxRecord};
@@ -34,6 +35,7 @@ struct FetchArgs {
     temp_directory: Option<String>,
     sort_memory_bytes: usize,
     threads: usize,
+    show_progress: bool,
     ids: Vec<String>,
 }
 
@@ -45,6 +47,7 @@ struct IndexArgs {
     temp_directory: Option<String>,
     sort_memory_bytes: usize,
     threads: usize,
+    show_progress: bool,
 }
 
 fn usage() -> &'static str {
@@ -71,6 +74,7 @@ FETCH OPTIONS:
     --temp-directory <DIR>     Directory for temporary files if auto-indexing.
     --sort-memory <MiB>        Auto-index sort memory budget. Default: 512
     --threads <N>              Auto-index worker threads. Default: available CPUs
+    --no-progress              Disable indexing progress on stderr.
     -h, --help                 Print this help message.
 
 INDEX OPTIONS:
@@ -81,6 +85,7 @@ INDEX OPTIONS:
     --temp-directory <DIR>     Directory for external sort temporary files.
     --sort-memory <MiB>        Memory budget before external sort. Default: 512
     --threads <N>              Index worker threads. Default: available CPUs
+    --no-progress              Disable progress output on stderr.
     -h, --help                 Print index-specific help.
 
 The .ffx stores full IDs, FASTA offsets, sequence lengths, and line layout.
@@ -105,6 +110,7 @@ OPTIONS:
     --temp-directory <DIR>     Directory for external sort temporary files.
     --sort-memory <MiB>        Memory budget before external sort. Default: 512
     --threads <N>              Index worker threads. Default: available CPUs
+    --no-progress              Disable progress output on stderr.
     -h, --help                 Print this help message.
 
 The --fasta path is pure Rust and does not need samtools indexes. The --fai
@@ -150,6 +156,7 @@ fn parse_fetch_args() -> Result<FetchArgs, String> {
     let mut temp_directory = None;
     let mut sort_memory_mib = DEFAULT_SORT_MEMORY_MIB;
     let mut threads = default_threads();
+    let mut show_progress = true;
     let mut ids = Vec::new();
     let mut arguments = env::args().skip(2);
 
@@ -191,6 +198,7 @@ fn parse_fetch_args() -> Result<FetchArgs, String> {
                     return Err("--threads must be greater than zero".to_string());
                 }
             }
+            "--no-progress" => show_progress = false,
             "--full-id" => id_mode = IdMode::Exact,
             "-h" | "--help" => return Err(usage().to_string()),
             _ if argument.starts_with('-') => {
@@ -216,6 +224,7 @@ fn parse_fetch_args() -> Result<FetchArgs, String> {
         temp_directory,
         sort_memory_bytes,
         threads,
+        show_progress,
         ids,
     })
 }
@@ -228,6 +237,7 @@ fn parse_index_args() -> Result<IndexArgs, String> {
     let mut temp_directory = None;
     let mut sort_memory_mib = DEFAULT_SORT_MEMORY_MIB;
     let mut threads = default_threads();
+    let mut show_progress = true;
     let mut arguments = env::args().skip(2);
 
     while let Some(argument) = arguments.next() {
@@ -259,6 +269,7 @@ fn parse_index_args() -> Result<IndexArgs, String> {
                     return Err("--threads must be greater than zero".to_string());
                 }
             }
+            "--no-progress" => show_progress = false,
             "-h" | "--help" => {
                 println!("{}", index_usage());
                 std::process::exit(0);
@@ -283,6 +294,7 @@ fn parse_index_args() -> Result<IndexArgs, String> {
         temp_directory,
         sort_memory_bytes,
         threads,
+        show_progress,
     })
 }
 
@@ -350,6 +362,7 @@ fn run_index_command() -> Result<(), Box<dyn Error>> {
                 arguments.temp_directory.as_deref(),
                 arguments.sort_memory_bytes,
                 arguments.threads,
+                arguments.show_progress,
             )?;
         }
         (Some(_), None) | (None, Some(_)) => {
@@ -366,6 +379,7 @@ fn run_index_command() -> Result<(), Box<dyn Error>> {
                 arguments.temp_directory.as_deref(),
                 arguments.sort_memory_bytes,
                 arguments.threads,
+                arguments.show_progress,
             )?;
         }
     }
@@ -396,6 +410,7 @@ fn run_fetch_command() -> Result<(), Box<dyn Error>> {
             arguments.temp_directory.as_deref(),
             arguments.sort_memory_bytes,
             arguments.threads,
+            arguments.show_progress,
         )?;
     }
 

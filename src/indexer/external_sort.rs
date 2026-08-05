@@ -1,5 +1,6 @@
 use super::sort_memory_cost;
 use crate::ffx::{IndexRecord, IndexStats, IndexWriter};
+use crate::progress::{ProgressBar, Unit};
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::fs::{self, File};
@@ -31,48 +32,77 @@ pub(super) fn write_index(
     memory_bytes: usize,
     threads: usize,
     input_is_sorted: bool,
+    show_progress: bool,
 ) -> io::Result<IndexStats> {
     if input_is_sorted {
         eprintln!("[INFO] input IDs are already sorted; skipping external sort");
-        return write_binary_index(input_path, output_path, expected_records, threads);
+        return write_binary_index(
+            input_path,
+            output_path,
+            expected_records,
+            threads,
+            show_progress,
+        );
     }
 
     let mut temporary = TemporaryRuns::new(input_path);
-    let mut runs = create_runs(input_path, memory_bytes, &mut temporary)?;
+    let mut runs = create_runs(
+        input_path,
+        memory_bytes,
+        expected_records,
+        &mut temporary,
+        show_progress,
+    )?;
+    let mut pass = 1;
     while runs.len() > MAX_MERGE_RUNS {
+        let phase = format!("merge pass {pass}");
+        let mut progress = ProgressBar::new(show_progress, phase, runs.len() as u64, Unit::Runs);
         let mut merged = Vec::new();
+        let mut consumed_runs = 0_u64;
         for group in runs.chunks(MAX_MERGE_RUNS) {
             let path = temporary.next_path();
             let mut writer = BufWriter::new(File::create(&path)?);
             merge_runs(group, |record| write_record(&mut writer, &record))?;
             writer.flush()?;
             merged.push(path);
+            consumed_runs += group.len() as u64;
+            progress.update(consumed_runs);
         }
+        progress.finish(consumed_runs);
         remove_runs(&runs);
         runs = merged;
+        pass += 1;
     }
 
     let mut writer = IndexWriter::with_threads(output_path, threads)?;
+    let mut progress = ProgressBar::new(show_progress, "write", expected_records, Unit::Records);
     let mut count = 0_u64;
     merge_runs(&runs, |record| {
         writer.add(record)?;
         count = count
             .checked_add(1)
             .ok_or_else(|| io::Error::other("Too many sorted records"))?;
+        progress.update(count);
         Ok(())
     })?;
     validate_count(count, expected_records)?;
-    writer.finish()
+    let stats = writer.finish()?;
+    progress.finish(count);
+    Ok(stats)
 }
 
 fn create_runs(
     input_path: &Path,
     memory_bytes: usize,
+    expected_records: u64,
     temporary: &mut TemporaryRuns,
+    show_progress: bool,
 ) -> io::Result<Vec<PathBuf>> {
     let mut input = BufReader::new(File::open(input_path)?);
     let mut pending = None;
     let mut runs = Vec::new();
+    let mut count = 0_u64;
+    let mut progress = ProgressBar::new(show_progress, "sort", expected_records, Unit::Records);
 
     loop {
         let mut records = Vec::new();
@@ -83,6 +113,10 @@ fn create_runs(
         }
 
         while let Some(record) = read_record(&mut input)? {
+            count = count
+                .checked_add(1)
+                .ok_or_else(|| io::Error::other("Too many records in sort input"))?;
+            progress.update(count);
             let record_bytes = sort_memory_cost(&record);
             if !records.is_empty()
                 && buffered_bytes
@@ -109,6 +143,8 @@ fn create_runs(
         runs.push(path);
     }
 
+    validate_count(count, expected_records)?;
+    progress.finish(count);
     Ok(runs)
 }
 
@@ -117,18 +153,23 @@ fn write_binary_index(
     output_path: &str,
     expected_records: u64,
     threads: usize,
+    show_progress: bool,
 ) -> io::Result<IndexStats> {
     let mut input = BufReader::new(File::open(input_path)?);
     let mut writer = IndexWriter::with_threads(output_path, threads)?;
+    let mut progress = ProgressBar::new(show_progress, "write", expected_records, Unit::Records);
     let mut count = 0_u64;
     while let Some(record) = read_record(&mut input)? {
         writer.add(record)?;
         count = count
             .checked_add(1)
             .ok_or_else(|| io::Error::other("Too many sorted records"))?;
+        progress.update(count);
     }
     validate_count(count, expected_records)?;
-    writer.finish()
+    let stats = writer.finish()?;
+    progress.finish(count);
+    Ok(stats)
 }
 
 fn merge_runs<F>(paths: &[PathBuf], mut visit: F) -> io::Result<()>
@@ -364,7 +405,7 @@ mod tests {
         }
         writer.flush().unwrap();
 
-        write_index(&input, output.to_str().unwrap(), 70, 1, 2, false).unwrap();
+        write_index(&input, output.to_str().unwrap(), 70, 1, 2, false, false).unwrap();
         let mut index = FfxIndex::open(output.to_str().unwrap()).unwrap();
         assert_eq!(index.find_exact("id-000").unwrap()[0].virtual_offset, 0);
         assert_eq!(index.find_exact("id-069").unwrap()[0].virtual_offset, 69);

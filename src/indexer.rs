@@ -3,12 +3,14 @@ mod scanner;
 
 use crate::fasta::FastaReader;
 use crate::ffx::{IndexRecord, IndexStats, IndexWriter, read_u64};
+use crate::progress::{self, ProgressBar, Unit};
 use std::error::Error;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, BufWriter, Seek, SeekFrom, Write};
 use std::mem;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 pub const DEFAULT_SORT_MEMORY_MIB: usize = 512;
 static NEXT_TEMPORARY_FILE: AtomicU64 = AtomicU64::new(0);
@@ -33,12 +35,22 @@ pub fn build_index_from_fasta(
     temp_directory: Option<&str>,
     sort_memory_bytes: usize,
     threads: usize,
+    show_progress: bool,
 ) -> Result<(), Box<dyn Error>> {
     let mut reader = FastaReader::with_threads(fasta_path, threads)?;
-    let mut builder = IndexBuilder::new(output_path, temp_directory, sort_memory_bytes, threads)?;
-    scanner::scan_fasta(&mut reader, |full_id, metadata| {
+    let mut builder = IndexBuilder::new(
+        output_path,
+        temp_directory,
+        sort_memory_bytes,
+        threads,
+        show_progress,
+    )?;
+    let mut scan_progress =
+        ProgressBar::new(show_progress, "scan", reader.total_bytes(), Unit::Bytes);
+    scanner::scan_fasta(&mut reader, &mut scan_progress, |full_id, metadata| {
         builder.add_record(&full_id, metadata)
     })?;
+    scan_progress.finish(reader.consumed_bytes());
 
     drop(reader);
     builder.finish(output_path)?;
@@ -52,21 +64,44 @@ pub fn build_index_from_fai_gzi(
     temp_directory: Option<&str>,
     sort_memory_bytes: usize,
     threads: usize,
+    show_progress: bool,
 ) -> Result<(), Box<dyn Error>> {
     let mut gzi = File::open(gzi_path)?;
     let gzi_count = read_gzi_count(&mut gzi)?;
-    let reader = BufReader::new(File::open(fai_path)?);
-    let mut builder = IndexBuilder::new(output_path, temp_directory, sort_memory_bytes, threads)?;
+    let fai = File::open(fai_path)?;
+    let fai_len = fai.metadata()?.len();
+    let mut reader = BufReader::new(fai);
+    let mut builder = IndexBuilder::new(
+        output_path,
+        temp_directory,
+        sort_memory_bytes,
+        threads,
+        show_progress,
+    )?;
+    let mut scan_progress = ProgressBar::new(show_progress, "scan", fai_len, Unit::Bytes);
+    let mut consumed = 0_u64;
+    let mut line = String::new();
 
-    for line in reader.lines() {
-        let line = line?;
+    loop {
+        line.clear();
+        let bytes = reader.read_line(&mut line)?;
+        if bytes == 0 {
+            break;
+        }
+        consumed = consumed
+            .checked_add(bytes as u64)
+            .ok_or_else(|| io::Error::other("FAI input is too large"))?;
         if line.trim().is_empty() {
+            scan_progress.update(consumed);
             continue;
         }
-        let (full_id, mut metadata) = parse_fai_record(&line)?;
+        let line = line.trim_end_matches(['\r', '\n']);
+        let (full_id, mut metadata) = parse_fai_record(line)?;
         metadata.virtual_offset = gzi_virtual_offset(&mut gzi, gzi_count, metadata.virtual_offset)?;
         builder.add_record(&full_id, metadata)?;
+        scan_progress.update(consumed);
     }
+    scan_progress.finish(consumed);
 
     builder.finish(output_path)?;
     Ok(())
@@ -154,6 +189,7 @@ struct IndexBuilder {
     last_id: Option<String>,
     input_is_sorted: bool,
     sort_input_path: PathBuf,
+    show_progress: bool,
 }
 
 impl IndexBuilder {
@@ -162,6 +198,7 @@ impl IndexBuilder {
         temp_directory: Option<&str>,
         sort_memory_bytes: usize,
         threads: usize,
+        show_progress: bool,
     ) -> io::Result<Self> {
         if sort_memory_bytes == 0 || threads == 0 {
             return Err(io::Error::other(
@@ -190,6 +227,7 @@ impl IndexBuilder {
             last_id: None,
             input_is_sorted: true,
             sort_input_path,
+            show_progress,
         })
     }
 
@@ -247,20 +285,36 @@ impl IndexBuilder {
             self.write_spilled_index(output_path)?
         } else {
             if !self.input_is_sorted {
+                let started = Instant::now();
+                progress::status(
+                    self.show_progress,
+                    "sort",
+                    &format!("sorting {} records in memory", self.record_count),
+                );
                 self.records
                     .sort_by(|left, right| left.full_id.cmp(&right.full_id));
+                progress::status(
+                    self.show_progress,
+                    "sort",
+                    &format!("done in {}", progress::format_duration(started.elapsed())),
+                );
             } else {
                 eprintln!("[INFO] input IDs are already sorted; skipping sort");
             }
             let records = mem::take(&mut self.records);
-            write_record_index(records, output_path, self.record_count, self.threads)?
+            write_record_index(
+                records,
+                output_path,
+                self.record_count,
+                self.threads,
+                self.show_progress,
+            )?
         };
         report_stats(&stats);
         Ok(())
     }
 
     fn spill_records(&mut self, record: IndexRecord) -> io::Result<()> {
-        eprintln!("[INFO] sort memory limit reached; spilling records for external sort");
         let mut sort_input = BufWriter::new(File::create(&self.sort_input_path)?);
         for buffered in self.records.drain(..) {
             external_sort::write_record(&mut sort_input, &buffered)?;
@@ -279,6 +333,7 @@ impl IndexBuilder {
             self.sort_memory_bytes,
             self.threads,
             self.input_is_sorted,
+            self.show_progress,
         )?)
     }
 }
@@ -316,6 +371,7 @@ fn write_record_index(
     output_path: &str,
     expected_records: u64,
     threads: usize,
+    show_progress: bool,
 ) -> io::Result<IndexStats> {
     if records.len() as u64 != expected_records {
         return Err(io::Error::new(
@@ -324,10 +380,16 @@ fn write_record_index(
         ));
     }
     let mut writer = IndexWriter::with_threads(output_path, threads)?;
+    let mut progress = ProgressBar::new(show_progress, "write", expected_records, Unit::Records);
+    let mut count = 0_u64;
     for record in records {
         writer.add(record)?;
+        count += 1;
+        progress.update(count);
     }
-    writer.finish()
+    let stats = writer.finish()?;
+    progress.finish(count);
+    Ok(stats)
 }
 
 fn read_gzi_count(file: &mut File) -> io::Result<u64> {
@@ -405,6 +467,7 @@ mod tests {
             None,
             1,
             2,
+            false,
         )
         .unwrap();
 
@@ -430,6 +493,7 @@ mod tests {
             None,
             usize::MAX,
             4,
+            false,
         )
         .unwrap();
 
@@ -458,8 +522,14 @@ mod tests {
             line_bases: 1,
             line_width: 2,
         };
-        let mut builder =
-            IndexBuilder::new(output.to_str().unwrap(), directory.to_str(), usize::MAX, 1).unwrap();
+        let mut builder = IndexBuilder::new(
+            output.to_str().unwrap(),
+            directory.to_str(),
+            usize::MAX,
+            1,
+            false,
+        )
+        .unwrap();
 
         builder.add_record("alpha", metadata).unwrap();
         builder.add_record("alpha", metadata).unwrap();
@@ -482,7 +552,8 @@ mod tests {
             line_bases: 1,
             line_width: 2,
         };
-        let mut builder = IndexBuilder::new(output.to_str().unwrap(), None, usize::MAX, 2).unwrap();
+        let mut builder =
+            IndexBuilder::new(output.to_str().unwrap(), None, usize::MAX, 2, false).unwrap();
         builder.add_record("zeta", metadata(30)).unwrap();
         builder.add_record("duplicate", metadata(20)).unwrap();
         builder.add_record("duplicate", metadata(10)).unwrap();
@@ -506,8 +577,14 @@ mod tests {
         let directory = test_path("temporary-directory");
         fs::create_dir(&directory).unwrap();
         let output = directory.join("output.ffx");
-        let builder =
-            IndexBuilder::new(output.to_str().unwrap(), directory.to_str(), usize::MAX, 1).unwrap();
+        let builder = IndexBuilder::new(
+            output.to_str().unwrap(),
+            directory.to_str(),
+            usize::MAX,
+            1,
+            false,
+        )
+        .unwrap();
         let input = builder.sort_input_path.clone();
         drop(builder);
         assert!(!input.exists());
@@ -523,7 +600,7 @@ mod tests {
             line_bases: 1,
             line_width: 2,
         };
-        let mut builder = IndexBuilder::new(output.to_str().unwrap(), None, 1, 2).unwrap();
+        let mut builder = IndexBuilder::new(output.to_str().unwrap(), None, 1, 2, false).unwrap();
         builder.add_record("zeta", metadata(30)).unwrap();
         builder.add_record("duplicate", metadata(20)).unwrap();
         builder.add_record("alpha", metadata(0)).unwrap();

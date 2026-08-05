@@ -48,6 +48,11 @@ Temporary records are stored in compact binary runs, with each sort run bounded
 by the requested memory budget. BGZF decompression and block encoding use all
 available CPUs by default; use `--threads <N>` to set the worker count.
 
+Indexing reports scan, sort, merge, and write progress on stderr. On a terminal
+the display refreshes in place with throughput and ETA; redirected output uses
+sparse milestone lines. Use `--no-progress` to disable it, including when
+`fetch` creates a missing index automatically.
+
 This writes:
 
 ```text

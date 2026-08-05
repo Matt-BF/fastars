@@ -129,6 +129,20 @@ impl BgzfReader {
         }))
     }
 
+    pub(crate) fn total_bytes(&self) -> u64 {
+        self.file_len
+    }
+
+    pub(crate) fn consumed_bytes(&self) -> u64 {
+        if self.started {
+            self.block_address
+                .saturating_add(self.block_size)
+                .min(self.file_len)
+        } else {
+            0
+        }
+    }
+
     pub(crate) fn recycle_block(&mut self, bytes: Vec<u8>) {
         match &mut self.loader {
             BlockLoader::Serial { spare_output, .. } => *spare_output = bytes,

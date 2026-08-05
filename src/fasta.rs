@@ -44,6 +44,20 @@ impl FastaReader {
         }
     }
 
+    pub(crate) fn total_bytes(&self) -> u64 {
+        match self {
+            Self::Bgzf(reader) => reader.total_bytes(),
+            Self::Plain(reader) => reader.file_len,
+        }
+    }
+
+    pub(crate) fn consumed_bytes(&self) -> u64 {
+        match self {
+            Self::Bgzf(reader) => reader.consumed_bytes(),
+            Self::Plain(reader) => reader.position,
+        }
+    }
+
     pub(crate) fn recycle_chunk(&mut self, chunk: FastaChunk) {
         match self {
             Self::Bgzf(reader) => reader.recycle_block(chunk.bytes),
@@ -73,14 +87,18 @@ impl FastaReader {
 
 pub(crate) struct PlainFastaReader {
     reader: BufReader<File>,
+    file_len: u64,
     position: u64,
     spare_chunk: Vec<u8>,
 }
 
 impl PlainFastaReader {
     fn new<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+        let file = File::open(path)?;
+        let file_len = file.metadata()?.len();
         Ok(Self {
-            reader: BufReader::new(File::open(path)?),
+            reader: BufReader::new(file),
+            file_len,
             position: 0,
             spare_chunk: Vec::new(),
         })
@@ -176,9 +194,12 @@ mod tests {
         fs::write(&path, b">alpha description\nACGT\nAC\n>beta\nTT\n").unwrap();
 
         let mut reader = FastaReader::with_threads(&path, 4).unwrap();
+        assert_eq!(reader.total_bytes(), 36);
+        assert_eq!(reader.consumed_bytes(), 0);
         let chunk = reader.read_chunk().unwrap().unwrap();
         assert_eq!(chunk.offset, 0);
         assert_eq!(chunk.bytes, b">alpha description\nACGT\nAC\n>beta\nTT\n");
+        assert_eq!(reader.consumed_bytes(), 36);
 
         reader.seek(19).unwrap();
         assert_eq!(reader.read_sequence(6, 4, 5).unwrap(), b"ACGTAC");

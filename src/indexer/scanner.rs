@@ -1,8 +1,13 @@
 use super::{RecordMetadata, parse_header_id, sequence_line_layout};
 use crate::fasta::FastaReader;
+use crate::progress::ProgressBar;
 use std::io;
 
-pub(super) fn scan_fasta<F>(reader: &mut FastaReader, add_record: F) -> io::Result<()>
+pub(super) fn scan_fasta<F>(
+    reader: &mut FastaReader,
+    progress: &mut ProgressBar,
+    add_record: F,
+) -> io::Result<()>
 where
     F: FnMut(String, RecordMetadata) -> io::Result<()>,
 {
@@ -10,6 +15,7 @@ where
     while let Some(chunk) = reader.read_chunk()? {
         scanner.push_chunk(chunk.offset, &chunk.bytes)?;
         reader.recycle_chunk(chunk);
+        progress.update(reader.consumed_bytes());
     }
     scanner.finish()
 }
