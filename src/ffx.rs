@@ -18,7 +18,10 @@ const CACHE_BLOCKS: usize = 4;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FfxRecord {
     pub record_id: u64,
+    /// The first whitespace-delimited token in the FASTA header.
     pub full_id: String,
+    /// The complete FASTA header without the leading `>` or line ending.
+    pub header: String,
     pub virtual_offset: u64,
     pub sequence_length: u64,
     pub line_bases: u64,
@@ -46,7 +49,16 @@ impl FfxIndex {
         })
     }
 
-    pub fn find_exact(&mut self, id: &str) -> io::Result<Vec<FfxRecord>> {
+    pub fn find_exact(&mut self, query: &str) -> io::Result<Vec<FfxRecord>> {
+        let id = primary_id(query);
+        let mut matches = self.find_exact_id(id)?;
+        if query.len() != id.len() {
+            matches.retain(|record| record.header == query);
+        }
+        Ok(matches)
+    }
+
+    fn find_exact_id(&mut self, id: &str) -> io::Result<Vec<FfxRecord>> {
         let mut matches = Vec::new();
         let mut block_index = self.lower_bound_block(id);
         while block_index < self.directory.len() {
@@ -65,13 +77,20 @@ impl FfxIndex {
     }
 
     pub fn find_prefix(&mut self, prefix: &str) -> io::Result<Vec<FfxRecord>> {
+        let id_prefix = primary_id(prefix);
+        if prefix.len() != id_prefix.len() {
+            let mut matches = self.find_exact_id(id_prefix)?;
+            matches.retain(|record| record.header.starts_with(prefix));
+            return Ok(matches);
+        }
+
         let mut matches = Vec::new();
-        let mut block_index = self.lower_bound_block(prefix);
+        let mut block_index = self.lower_bound_block(id_prefix);
         while block_index < self.directory.len() {
             let records = self.read_block(block_index)?;
-            let start = records.partition_point(|record| record.full_id.as_str() < prefix);
+            let start = records.partition_point(|record| record.full_id.as_str() < id_prefix);
             for record in records.into_iter().skip(start) {
-                if record.full_id.starts_with(prefix) {
+                if record.full_id.starts_with(id_prefix) {
                     matches.push(record);
                 } else {
                     return Ok(matches);
@@ -97,7 +116,7 @@ impl FfxIndex {
     {
         for block_index in 0..self.directory.len() {
             for record in self.read_block(block_index)? {
-                if regex.is_match(&record.full_id) != invert {
+                if regex.is_match(&record.header) != invert {
                     visit(record)?;
                 }
             }
@@ -135,6 +154,14 @@ impl FfxIndex {
     }
 }
 
+fn primary_id(header: &str) -> &str {
+    let end = header
+        .bytes()
+        .position(|byte| byte.is_ascii_whitespace())
+        .unwrap_or(header.len());
+    &header[..end]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -155,11 +182,18 @@ mod tests {
     fn record(id: &str, offset: u64) -> IndexRecord {
         IndexRecord {
             full_id: id.to_string(),
+            header_suffix: None,
             virtual_offset: offset,
             sequence_length: u32::MAX as u64 + 10,
             line_bases: 1_000_000,
             line_width: 1_000_002,
         }
+    }
+
+    fn described_record(id: &str, header: &str, offset: u64) -> IndexRecord {
+        let mut record = record(id, offset);
+        record.header_suffix = Some(header.strip_prefix(id).unwrap().into());
+        record
     }
 
     #[test]
@@ -168,8 +202,8 @@ mod tests {
         let mut writer = IndexWriter::with_limits(output.to_str().unwrap(), 2, 1024).unwrap();
         for value in [
             record("a", 10),
-            record("duplicate", 20),
-            record("duplicate", 30),
+            described_record("duplicate", "duplicate first description", 20),
+            described_record("duplicate", "duplicate second description", 30),
             record("duplicate", 40),
             record("prefix-1", 50),
             record("prefix-2", 60),
@@ -181,11 +215,21 @@ mod tests {
 
         let mut index = FfxIndex::open(output.to_str().unwrap()).unwrap();
         assert_eq!(index.find_exact("duplicate").unwrap().len(), 3);
+        assert_eq!(
+            index.find_exact("duplicate second description").unwrap()[0].virtual_offset,
+            30
+        );
         assert_eq!(index.find_prefix("prefix-").unwrap().len(), 2);
+        assert_eq!(
+            index.find_prefix("duplicate first").unwrap()[0].header,
+            "duplicate first description"
+        );
         assert!(index.find_exact("missing").unwrap().is_empty());
         let regex = Regex::new("^(a|z)$").unwrap();
         assert_eq!(index.find_regex(&regex, false).unwrap().len(), 2);
         assert_eq!(index.find_regex(&regex, true).unwrap().len(), 5);
+        let description = Regex::new("second description$").unwrap();
+        assert_eq!(index.find_regex(&description, false).unwrap().len(), 1);
         fs::remove_file(output).unwrap();
     }
 

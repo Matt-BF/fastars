@@ -1,5 +1,7 @@
 use super::FfxRecord;
-use super::format::{DirectoryEntry, FLAG_COMPRESSED, FLAG_DELTA_OFFSETS, FLAG_FRONT_CODED};
+use super::format::{
+    DirectoryEntry, FLAG_COMPRESSED, FLAG_DELTA_OFFSETS, FLAG_FRONT_CODED, FLAG_FULL_HEADERS,
+};
 use std::io::{self, Cursor, Read, Write};
 
 const ZSTD_LEVEL: i32 = 3;
@@ -7,6 +9,7 @@ const ZSTD_LEVEL: i32 = 3;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct IndexRecord {
     pub full_id: String,
+    pub header_suffix: Option<Box<str>>,
     pub virtual_offset: u64,
     pub sequence_length: u64,
     pub line_bases: u64,
@@ -24,16 +27,21 @@ pub(crate) fn encode_block(records: &[IndexRecord]) -> io::Result<EncodedBlock> 
         return invalid("Cannot encode an empty .ffx block");
     }
 
+    let stores_headers = records.iter().any(|record| record.header_suffix.is_some());
     let mut candidates = Vec::with_capacity(4);
     for front_coded in [false, true] {
         for delta_offsets in [false, true] {
-            if let Some(raw) = encode_records(records, front_coded, delta_offsets)? {
+            if let Some(raw) = encode_records(records, front_coded, delta_offsets, stores_headers)?
+            {
                 let mut flags = 0;
                 if front_coded {
                     flags |= FLAG_FRONT_CODED;
                 }
                 if delta_offsets {
                     flags |= FLAG_DELTA_OFFSETS;
+                }
+                if stores_headers {
+                    flags |= FLAG_FULL_HEADERS;
                 }
                 candidates.push((raw, flags));
             }
@@ -77,6 +85,7 @@ fn encode_records(
     records: &[IndexRecord],
     front_coded: bool,
     delta_offsets: bool,
+    stores_headers: bool,
 ) -> io::Result<Option<Vec<u8>>> {
     let mut output = Vec::new();
     let mut previous_id: &[u8] = &[];
@@ -92,6 +101,12 @@ fn encode_records(
         } else {
             write_varint(&mut output, id.len() as u64);
             output.extend_from_slice(id);
+        }
+
+        if stores_headers {
+            let suffix = record.header_suffix.as_deref().unwrap_or("");
+            write_varint(&mut output, suffix.len() as u64);
+            output.extend_from_slice(suffix.as_bytes());
         }
 
         if delta_offsets && position > 0 {
@@ -143,6 +158,27 @@ fn decode_records(raw: &[u8], entry: &DirectoryEntry) -> io::Result<Vec<FfxRecor
         {
             return invalid("IDs within .ffx block are not sorted");
         }
+        let header = if entry.flags & FLAG_FULL_HEADERS != 0 {
+            let suffix_len = read_length(raw, &mut cursor)?;
+            let suffix = take(raw, &mut cursor, suffix_len)?;
+            if suffix
+                .first()
+                .is_some_and(|byte| !byte.is_ascii_whitespace())
+                || suffix.contains(&b'\n')
+                || suffix.contains(&b'\r')
+            {
+                return invalid("Invalid complete FASTA header in .ffx");
+            }
+            let suffix = std::str::from_utf8(suffix).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "Non-UTF-8 header in .ffx")
+            })?;
+            let mut header = String::with_capacity(full_id.len() + suffix.len());
+            header.push_str(&full_id);
+            header.push_str(suffix);
+            header
+        } else {
+            full_id.clone()
+        };
 
         let encoded_offset = read_varint(raw, &mut cursor)?;
         let virtual_offset = if entry.flags & FLAG_DELTA_OFFSETS != 0 && position > 0 {
@@ -168,6 +204,7 @@ fn decode_records(raw: &[u8], entry: &DirectoryEntry) -> io::Result<Vec<FfxRecor
         records.push(FfxRecord {
             record_id,
             full_id,
+            header,
             virtual_offset,
             sequence_length,
             line_bases,
@@ -264,6 +301,7 @@ mod tests {
     fn record(id: &str, offset: u64) -> IndexRecord {
         IndexRecord {
             full_id: id.to_string(),
+            header_suffix: None,
             virtual_offset: offset,
             sequence_length: 100_000,
             line_bases: 100_000,
@@ -308,11 +346,26 @@ mod tests {
             record("α-long-prefix-2", (1 << 40) + 10),
         ];
         let encoded = encode_block(&records).unwrap();
+        assert_eq!(encoded.flags & FLAG_FULL_HEADERS, 0);
         let decoded = decode_block(&encoded.stored, &entry(&encoded, &records)).unwrap();
         assert_eq!(decoded.len(), 2);
         assert_eq!(decoded[0].record_id, 7);
         assert_eq!(decoded[1].full_id, records[1].full_id);
+        assert_eq!(decoded[1].header, records[1].full_id);
         assert_eq!(decoded[1].line_bases, 100_000);
+    }
+
+    #[test]
+    fn full_headers_round_trip_as_id_suffixes() {
+        let mut records = vec![record("alpha", 1), record("beta", 2)];
+        records[0].header_suffix = Some(" first description".into());
+        records[1].header_suffix = Some("\tsecond description".into());
+
+        let encoded = encode_block(&records).unwrap();
+        assert_ne!(encoded.flags & FLAG_FULL_HEADERS, 0);
+        let decoded = decode_block(&encoded.stored, &entry(&encoded, &records)).unwrap();
+        assert_eq!(decoded[0].header, "alpha first description");
+        assert_eq!(decoded[1].header, "beta\tsecond description");
     }
 
     #[test]

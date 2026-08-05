@@ -47,9 +47,11 @@ pub fn build_index_from_fasta(
     )?;
     let mut scan_progress =
         ProgressBar::new(show_progress, "scan", reader.total_bytes(), Unit::Bytes);
-    scanner::scan_fasta(&mut reader, &mut scan_progress, |full_id, metadata| {
-        builder.add_record(&full_id, metadata)
-    })?;
+    scanner::scan_fasta(
+        &mut reader,
+        &mut scan_progress,
+        |full_id, header, metadata| builder.add_record(&full_id, &header, metadata),
+    )?;
     scan_progress.finish(reader.consumed_bytes());
 
     drop(reader);
@@ -98,7 +100,7 @@ pub fn build_index_from_fai_gzi(
         let line = line.trim_end_matches(['\r', '\n']);
         let (full_id, mut metadata) = parse_fai_record(line)?;
         metadata.virtual_offset = gzi_virtual_offset(&mut gzi, gzi_count, metadata.virtual_offset)?;
-        builder.add_record(&full_id, metadata)?;
+        builder.add_record(&full_id, &full_id, metadata)?;
         scan_progress.update(consumed);
     }
     scan_progress.finish(consumed);
@@ -107,7 +109,7 @@ pub fn build_index_from_fai_gzi(
     Ok(())
 }
 
-pub(super) fn parse_header_id(bytes: &[u8]) -> io::Result<String> {
+pub(super) fn parse_header(bytes: &[u8]) -> io::Result<(String, String)> {
     let mut end = bytes.len();
     if end > 0 && bytes[end - 1] == b'\n' {
         end -= 1;
@@ -128,8 +130,9 @@ pub(super) fn parse_header_id(bytes: &[u8]) -> io::Result<String> {
         ));
     }
 
-    String::from_utf8(content[..id_end].to_vec())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Non-UTF-8 FASTA ID"))
+    let header = String::from_utf8(content.to_vec())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Non-UTF-8 FASTA header"))?;
+    Ok((header[..id_end].to_string(), header))
 }
 
 pub(super) fn sequence_line_layout(bytes: &[u8]) -> io::Result<(u64, u64)> {
@@ -231,11 +234,33 @@ impl IndexBuilder {
         })
     }
 
-    fn add_record(&mut self, full_id: &str, metadata: RecordMetadata) -> io::Result<()> {
-        if full_id.contains(['\t', '\n', '\r']) {
+    fn add_record(
+        &mut self,
+        full_id: &str,
+        header: &str,
+        metadata: RecordMetadata,
+    ) -> io::Result<()> {
+        if full_id.bytes().any(|byte| byte.is_ascii_whitespace()) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "FASTA IDs containing tabs or newlines are not supported",
+                "Whitespace inside the primary FASTA ID is not supported",
+            ));
+        }
+        let header_suffix = header.strip_prefix(full_id).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "FASTA header does not start with its primary ID",
+            )
+        })?;
+        if header_suffix
+            .bytes()
+            .next()
+            .is_some_and(|byte| !byte.is_ascii_whitespace())
+            || header_suffix.contains(['\n', '\r'])
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Invalid complete FASTA header",
             ));
         }
 
@@ -250,6 +275,7 @@ impl IndexBuilder {
 
         let record = IndexRecord {
             full_id: full_id.to_string(),
+            header_suffix: (!header_suffix.is_empty()).then(|| header_suffix.into()),
             virtual_offset: metadata.virtual_offset,
             sequence_length: metadata.sequence_length,
             line_bases: metadata.line_bases,
@@ -342,6 +368,13 @@ fn sort_memory_cost(record: &IndexRecord) -> usize {
     record
         .full_id
         .len()
+        .saturating_add(
+            record
+                .header_suffix
+                .as_deref()
+                .map(str::len)
+                .unwrap_or_default(),
+        )
         .saturating_add(3 * mem::size_of::<IndexRecord>())
 }
 
@@ -500,9 +533,12 @@ mod tests {
         let mut index = FfxIndex::open(output.to_str().unwrap()).unwrap();
         let alpha = index.find_exact("alpha").unwrap().pop().unwrap();
         let zeta = index.find_exact("zeta").unwrap().pop().unwrap();
+        let zeta_by_header = index.find_exact("zeta description").unwrap().pop().unwrap();
         assert_eq!(alpha.virtual_offset, 33);
         assert_eq!(alpha.sequence_length, 3);
         assert_eq!(zeta.virtual_offset, 18);
+        assert_eq!(zeta.header, "zeta description");
+        assert_eq!(zeta_by_header.virtual_offset, zeta.virtual_offset);
         assert_eq!(zeta.sequence_length, 6);
         assert_eq!((zeta.line_bases, zeta.line_width), (4, 5));
 
@@ -531,12 +567,12 @@ mod tests {
         )
         .unwrap();
 
-        builder.add_record("alpha", metadata).unwrap();
-        builder.add_record("alpha", metadata).unwrap();
-        builder.add_record("zeta", metadata).unwrap();
+        builder.add_record("alpha", "alpha", metadata).unwrap();
+        builder.add_record("alpha", "alpha", metadata).unwrap();
+        builder.add_record("zeta", "zeta", metadata).unwrap();
         assert!(builder.input_is_sorted);
 
-        builder.add_record("beta", metadata).unwrap();
+        builder.add_record("beta", "beta", metadata).unwrap();
         assert!(!builder.input_is_sorted);
 
         drop(builder);
@@ -554,10 +590,14 @@ mod tests {
         };
         let mut builder =
             IndexBuilder::new(output.to_str().unwrap(), None, usize::MAX, 2, false).unwrap();
-        builder.add_record("zeta", metadata(30)).unwrap();
-        builder.add_record("duplicate", metadata(20)).unwrap();
-        builder.add_record("duplicate", metadata(10)).unwrap();
-        builder.add_record("alpha", metadata(0)).unwrap();
+        builder.add_record("zeta", "zeta", metadata(30)).unwrap();
+        builder
+            .add_record("duplicate", "duplicate", metadata(20))
+            .unwrap();
+        builder
+            .add_record("duplicate", "duplicate", metadata(10))
+            .unwrap();
+        builder.add_record("alpha", "alpha", metadata(0)).unwrap();
         builder.finish(output.to_str().unwrap()).unwrap();
 
         let mut index = FfxIndex::open(output.to_str().unwrap()).unwrap();
@@ -601,10 +641,14 @@ mod tests {
             line_width: 2,
         };
         let mut builder = IndexBuilder::new(output.to_str().unwrap(), None, 1, 2, false).unwrap();
-        builder.add_record("zeta", metadata(30)).unwrap();
-        builder.add_record("duplicate", metadata(20)).unwrap();
-        builder.add_record("alpha", metadata(0)).unwrap();
-        builder.add_record("duplicate", metadata(10)).unwrap();
+        builder.add_record("zeta", "zeta", metadata(30)).unwrap();
+        builder
+            .add_record("duplicate", "duplicate", metadata(20))
+            .unwrap();
+        builder.add_record("alpha", "alpha", metadata(0)).unwrap();
+        builder
+            .add_record("duplicate", "duplicate", metadata(10))
+            .unwrap();
         builder.finish(output.to_str().unwrap()).unwrap();
 
         let mut index = FfxIndex::open(output.to_str().unwrap()).unwrap();

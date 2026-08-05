@@ -39,8 +39,9 @@ The preferred path scans the BGZF-compressed or uncompressed FASTA directly:
 fastars index --fasta sequences.fna.bgz
 ```
 
-Set `--sort-memory <MiB>` to change the budget; larger indexes automatically fall
-back to a platform-independent external merge sort in `--temp-directory`. Up to 512 MiB is used for an in-memory ID sort by default. 
+Set `--sort-memory <MiB>` to change the budget; larger indexes automatically
+fall back to a platform-independent external merge sort in `--temp-directory`.
+Up to 512 MiB is used for an in-memory ID sort by default.
 Temporary records are stored in compact binary runs, with each sort run bounded
 by the requested memory budget. BGZF decompression and block encoding use all
 available CPUs by default; use `--threads <N>` to set the worker count.
@@ -63,29 +64,49 @@ fastars index \
 ```
 
 The resulting `.ffx` is a compressed, self-contained fetch index. It stores
-full IDs, BGZF virtual offsets, sequence lengths, and FASTA line layout in
-independently compressed blocks for fast lookup without loading the complete
-index.
+primary IDs, complete FASTA headers, BGZF virtual offsets, sequence lengths,
+and FASTA line layout in independently compressed blocks for fast lookup
+without loading the complete index. Building from `.fai/.gzi` cannot preserve
+header descriptions because `.fai` contains only primary IDs.
 
 After building the index, use `--id-mode prefix` to fetch IDs by literal prefix
 or `--id-regexp` to select indexed IDs with a regular expression. Examples for
 both modes are below.
 
-## Fetch by exact full ID
+## Fetch by exact ID or header
 
-Exact full-ID lookup is the default:
+Exact lookup is the default. A primary ID query returns the record with its
+complete original header:
 
 ```bash
 fastars fetch --fasta sequences.fna.bgz \
   'IMGVR_UViG_2582581227_000001|2582581227|2582690522' > selected.fna
 ```
 
+Given this header:
+
+```text
+>ABC123 hypothetical protein [Species name]
+```
+
+both `ABC123` and the quoted complete header are valid exact queries:
+
+```bash
+fastars fetch --fasta sequences.fna.bgz ABC123
+fastars fetch --fasta sequences.fna.bgz \
+  'ABC123 hypothetical protein [Species name]'
+```
+
+If multiple records share a primary ID, the short query returns all of them;
+the complete-header query can select one specific record.
+
 If `sequences.fna.bgz.ffx` is missing, `fastars` builds it automatically from
 the FASTA before fetching.
 
 ## Fetch by prefix
 
-Use prefix mode when your query is the beginning of the indexed full ID:
+Use prefix mode when your query is the beginning of a primary ID or complete
+header:
 
 ```bash
 fastars fetch --fasta sequences.fna.bgz \
@@ -99,6 +120,8 @@ IMGVR_UViG_2582581227_000001|2582581227|2582690522
 ```
 
 the query `IMGVR_UViG_2582581227_000001` matches because it is a literal prefix.
+For the descriptive `ABC123` example above, the prefix
+`ABC123 hypothetical` also matches.
 
 ## Fetch from an ID file
 
@@ -110,20 +133,21 @@ fastars fetch --fasta sequences.fna.bgz \
   -f short_ids.txt > selected.fna
 ```
 
-With `--id-mode exact`, each line must be a full exact ID. With
-`--id-mode prefix`, each line is treated as a literal prefix.
+With `--id-mode exact`, each line may be a primary ID or complete header. With
+`--id-mode prefix`, each line is treated as a literal prefix of an ID or header.
 `-m` is the short form of `--id-mode`.
 
-## Search indexed IDs with regex
+## Search complete headers with regex
 
-`--id-regexp` scans the indexed full IDs, not the FASTA sequence text:
+`--id-regexp` scans complete indexed headers, including descriptions, but not
+the FASTA sequence text:
 
 ```bash
 fastars fetch --fasta sequences.fna.bgz \
   --id-regexp 'GVMAG' > gvmag_records.fna
 ```
 
-Invert the regex to fetch everything whose full ID does not match:
+Invert the regex to fetch everything whose header does not match:
 
 ```bash
 fastars fetch --fasta sequences.fna.bgz \

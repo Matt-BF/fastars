@@ -114,8 +114,22 @@ impl IndexWriter {
     }
 
     pub(crate) fn add(&mut self, record: IndexRecord) -> io::Result<()> {
-        if record.full_id.is_empty() || record.full_id.contains(['\t', '\n', '\r']) {
+        if record.full_id.is_empty()
+            || record
+                .full_id
+                .bytes()
+                .any(|byte| byte.is_ascii_whitespace())
+        {
             return invalid("Invalid FASTA ID in sorted index input");
+        }
+        let header_suffix = record.header_suffix.as_deref().unwrap_or("");
+        if header_suffix
+            .bytes()
+            .next()
+            .is_some_and(|byte| !byte.is_ascii_whitespace())
+            || header_suffix.contains(['\n', '\r'])
+        {
+            return invalid("Invalid complete FASTA header in sorted index input");
         }
         if record.line_bases == 0 || record.line_width < record.line_bases {
             return invalid("Invalid FASTA line layout in sorted index input");
@@ -128,7 +142,11 @@ impl IndexWriter {
 
         // A plain-ID record uses at most ten bytes for each of its five
         // varints, so this is a conservative bound with room for framing.
-        let estimated_size = record.full_id.len().saturating_add(64);
+        let estimated_size = record
+            .full_id
+            .len()
+            .saturating_add(header_suffix.len())
+            .saturating_add(64);
         if !self.pending.is_empty()
             && (self.pending.len() >= self.target_records as usize
                 || self.pending_size.saturating_add(estimated_size) > self.max_raw_block_size)

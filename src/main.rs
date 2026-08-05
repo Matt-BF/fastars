@@ -127,10 +127,9 @@ fn default_ffx_path(fasta: &str) -> String {
 fn normalize_id(value: &str) -> String {
     value
         .trim()
-        .trim_start_matches('>')
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
+        .strip_prefix('>')
+        .unwrap_or(value.trim())
+        .trim()
         .to_string()
 }
 
@@ -335,7 +334,7 @@ fn write_record(
     reader.seek(record.virtual_offset)?;
     let sequence =
         reader.read_sequence(record.sequence_length, record.line_bases, record.line_width)?;
-    writeln!(output, ">{}", record.full_id)?;
+    writeln!(output, ">{}", record.header)?;
     for line in sequence.chunks(60) {
         output.write_all(line)?;
         output.write_all(b"\n")?;
@@ -493,5 +492,17 @@ fn main() {
     if let Err(error) = result {
         eprintln!("[ERROR] {error}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn query_normalization_preserves_complete_headers() {
+        assert_eq!(normalize_id("seq1 description"), "seq1 description");
+        assert_eq!(normalize_id(">seq1 description\n"), "seq1 description");
+        assert_eq!(normalize_id("  seq1  "), "seq1");
     }
 }

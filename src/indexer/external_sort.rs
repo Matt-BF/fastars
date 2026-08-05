@@ -8,12 +8,26 @@ use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 const MAX_MERGE_RUNS: usize = 64;
+const HAS_HEADER_SUFFIX: u64 = 1 << 63;
 
 pub(super) fn write_record<W: Write>(writer: &mut W, record: &IndexRecord) -> io::Result<()> {
-    let id_length = u64::try_from(record.full_id.len())
+    let mut id_length = u64::try_from(record.full_id.len())
         .map_err(|_| io::Error::other("FASTA ID is too long"))?;
+    let header_suffix = record.header_suffix.as_deref().unwrap_or("");
+    if id_length >= HAS_HEADER_SUFFIX {
+        return Err(io::Error::other("FASTA ID is too long"));
+    }
+    let suffix_length = u32::try_from(header_suffix.len())
+        .map_err(|_| io::Error::other("FASTA header is too long"))?;
+    if record.header_suffix.is_some() {
+        id_length |= HAS_HEADER_SUFFIX;
+    }
     writer.write_all(&id_length.to_le_bytes())?;
     writer.write_all(record.full_id.as_bytes())?;
+    if record.header_suffix.is_some() {
+        writer.write_all(&suffix_length.to_le_bytes())?;
+        writer.write_all(header_suffix.as_bytes())?;
+    }
     for value in [
         record.virtual_offset,
         record.sequence_length,
@@ -198,9 +212,11 @@ where
 }
 
 fn read_record<R: Read>(reader: &mut R) -> io::Result<Option<IndexRecord>> {
-    let Some(id_length) = read_optional_u64(reader)? else {
+    let Some(encoded_id_length) = read_optional_u64(reader)? else {
         return Ok(None);
     };
+    let has_header_suffix = encoded_id_length & HAS_HEADER_SUFFIX != 0;
+    let id_length = encoded_id_length & !HAS_HEADER_SUFFIX;
     let id_length = usize::try_from(id_length).map_err(|_| {
         io::Error::new(io::ErrorKind::InvalidData, "Temporary FASTA ID is too long")
     })?;
@@ -215,8 +231,23 @@ fn read_record<R: Read>(reader: &mut R) -> io::Result<Option<IndexRecord>> {
             "Temporary sort record has a non-UTF-8 FASTA ID",
         )
     })?;
+    let header_suffix = if has_header_suffix {
+        let suffix_length = read_u32(reader)? as usize;
+        let mut suffix = vec![0_u8; suffix_length];
+        reader.read_exact(&mut suffix)?;
+        let suffix = String::from_utf8(suffix).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Temporary sort record has a non-UTF-8 FASTA header",
+            )
+        })?;
+        Some(suffix.into_boxed_str())
+    } else {
+        None
+    };
     Ok(Some(IndexRecord {
         full_id,
+        header_suffix,
         virtual_offset: read_u64(reader)?,
         sequence_length: read_u64(reader)?,
         line_bases: read_u64(reader)?,
@@ -238,6 +269,12 @@ fn read_u64<R: Read>(reader: &mut R) -> io::Result<u64> {
     let mut bytes = [0_u8; 8];
     reader.read_exact(&mut bytes)?;
     Ok(u64::from_le_bytes(bytes))
+}
+
+fn read_u32<R: Read>(reader: &mut R) -> io::Result<u32> {
+    let mut bytes = [0_u8; 4];
+    reader.read_exact(&mut bytes)?;
+    Ok(u32::from_le_bytes(bytes))
 }
 
 fn validate_count(actual: u64, expected: u64) -> io::Result<()> {
@@ -337,6 +374,7 @@ mod tests {
     fn record(id: &str, offset: u64) -> IndexRecord {
         IndexRecord {
             full_id: id.to_string(),
+            header_suffix: None,
             virtual_offset: offset,
             sequence_length: 10,
             line_bases: 10,
@@ -346,7 +384,8 @@ mod tests {
 
     #[test]
     fn binary_records_round_trip() {
-        let expected = record("alpha", 42);
+        let mut expected = record("alpha", 42);
+        expected.header_suffix = Some(" description with spaces".into());
         let mut bytes = Vec::new();
         write_record(&mut bytes, &expected).unwrap();
         let mut input = bytes.as_slice();

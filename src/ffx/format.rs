@@ -8,7 +8,9 @@ const DIRECTORY_FIXED_SIZE: u64 = 56;
 pub(crate) const FLAG_COMPRESSED: u64 = 1;
 pub(crate) const FLAG_FRONT_CODED: u64 = 1 << 1;
 pub(crate) const FLAG_DELTA_OFFSETS: u64 = 1 << 2;
-const KNOWN_FLAGS: u64 = FLAG_COMPRESSED | FLAG_FRONT_CODED | FLAG_DELTA_OFFSETS;
+pub(crate) const FLAG_FULL_HEADERS: u64 = 1 << 3;
+const KNOWN_FLAGS: u64 =
+    FLAG_COMPRESSED | FLAG_FRONT_CODED | FLAG_DELTA_OFFSETS | FLAG_FULL_HEADERS;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Header {

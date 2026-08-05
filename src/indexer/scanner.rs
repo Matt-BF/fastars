@@ -1,4 +1,4 @@
-use super::{RecordMetadata, parse_header_id, sequence_line_layout};
+use super::{RecordMetadata, parse_header, sequence_line_layout};
 use crate::fasta::FastaReader;
 use crate::progress::ProgressBar;
 use std::io;
@@ -9,7 +9,7 @@ pub(super) fn scan_fasta<F>(
     add_record: F,
 ) -> io::Result<()>
 where
-    F: FnMut(String, RecordMetadata) -> io::Result<()>,
+    F: FnMut(String, String, RecordMetadata) -> io::Result<()>,
 {
     let mut scanner = FastaScanner::new(add_record);
     while let Some(chunk) = reader.read_chunk()? {
@@ -29,7 +29,7 @@ struct FastaScanner<F> {
 
 impl<F> FastaScanner<F>
 where
-    F: FnMut(String, RecordMetadata) -> io::Result<()>,
+    F: FnMut(String, String, RecordMetadata) -> io::Result<()>,
 {
     fn new(add_record: F) -> Self {
         Self {
@@ -83,7 +83,8 @@ where
     fn process_line(&mut self, offset: u64, bytes: &[u8]) -> io::Result<()> {
         if bytes.starts_with(b">") {
             self.finish_record()?;
-            self.current = Some(PendingRecord::new(parse_header_id(bytes)?));
+            let (id, header) = parse_header(bytes)?;
+            self.current = Some(PendingRecord::new(id, header));
             return Ok(());
         }
 
@@ -100,13 +101,14 @@ where
         let Some(record) = self.current.take() else {
             return Ok(());
         };
-        let (id, metadata) = record.finish()?;
-        (self.add_record)(id, metadata)
+        let (id, header, metadata) = record.finish()?;
+        (self.add_record)(id, header, metadata)
     }
 }
 
 struct PendingRecord {
     id: String,
+    header: String,
     sequence_offset: Option<u64>,
     sequence_length: u64,
     line_bases: u64,
@@ -115,9 +117,10 @@ struct PendingRecord {
 }
 
 impl PendingRecord {
-    fn new(id: String) -> Self {
+    fn new(id: String, header: String) -> Self {
         Self {
             id,
+            header,
             sequence_offset: None,
             sequence_length: 0,
             line_bases: 0,
@@ -156,9 +159,10 @@ impl PendingRecord {
         Ok(())
     }
 
-    fn finish(self) -> io::Result<(String, RecordMetadata)> {
+    fn finish(self) -> io::Result<(String, String, RecordMetadata)> {
         Ok((
             self.id,
+            self.header,
             RecordMetadata {
                 virtual_offset: self.sequence_offset.ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidData, "FASTA record has no sequence")
@@ -184,8 +188,8 @@ mod tests {
     #[test]
     fn scanner_joins_lines_across_chunks_without_changing_offsets() {
         let mut records = Vec::new();
-        let mut scanner = FastaScanner::new(|id, metadata| {
-            records.push((id, metadata));
+        let mut scanner = FastaScanner::new(|id, header, metadata| {
+            records.push((id, header, metadata));
             Ok(())
         });
         scanner.push_chunk(0, b">alpha descr").unwrap();
@@ -195,11 +199,13 @@ mod tests {
 
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].0, "alpha");
-        assert_eq!(records[0].1.virtual_offset, 19);
-        assert_eq!(records[0].1.sequence_length, 6);
-        assert_eq!((records[0].1.line_bases, records[0].1.line_width), (4, 5));
+        assert_eq!(records[0].1, "alpha description");
+        assert_eq!(records[0].2.virtual_offset, 19);
+        assert_eq!(records[0].2.sequence_length, 6);
+        assert_eq!((records[0].2.line_bases, records[0].2.line_width), (4, 5));
         assert_eq!(records[1].0, "beta");
-        assert_eq!(records[1].1.virtual_offset, 34);
-        assert_eq!(records[1].1.sequence_length, 2);
+        assert_eq!(records[1].1, "beta");
+        assert_eq!(records[1].2.virtual_offset, 34);
+        assert_eq!(records[1].2.sequence_length, 2);
     }
 }
