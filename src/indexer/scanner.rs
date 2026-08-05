@@ -9,6 +9,7 @@ where
     let mut scanner = FastaScanner::new(add_record);
     while let Some(chunk) = reader.read_chunk()? {
         scanner.push_chunk(chunk.offset, &chunk.bytes)?;
+        reader.recycle_chunk(chunk);
     }
     scanner.finish()
 }

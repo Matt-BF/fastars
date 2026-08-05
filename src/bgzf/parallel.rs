@@ -15,10 +15,12 @@ struct DecompressJob {
     address: u64,
     size: u64,
     compressed: Vec<u8>,
+    output: Vec<u8>,
 }
 
 struct DecompressResult {
     sequence: usize,
+    input: Vec<u8>,
     block: io::Result<LoadedBlock>,
 }
 
@@ -34,6 +36,8 @@ pub(super) struct ParallelBlockLoader {
     submitted: usize,
     delivered: usize,
     ready: Vec<DecompressResult>,
+    spare_inputs: Vec<Vec<u8>>,
+    spare_outputs: Vec<Vec<u8>>,
     max_in_flight: usize,
 }
 
@@ -47,7 +51,8 @@ impl ParallelBlockLoader {
             let result_sender = result_sender.clone();
             workers.push(thread::spawn(move || {
                 while let Ok(job) = receiver.recv() {
-                    let block = gzip_decompress(&job.compressed).map(|bytes| LoadedBlock {
+                    let input = job.compressed;
+                    let block = gzip_decompress(&input, job.output).map(|bytes| LoadedBlock {
                         address: job.address,
                         size: job.size,
                         bytes,
@@ -55,6 +60,7 @@ impl ParallelBlockLoader {
                     if result_sender
                         .send(DecompressResult {
                             sequence: job.sequence,
+                            input,
                             block,
                         })
                         .is_err()
@@ -78,6 +84,8 @@ impl ParallelBlockLoader {
             submitted: 0,
             delivered: 0,
             ready: Vec::new(),
+            spare_inputs: Vec::new(),
+            spare_outputs: Vec::new(),
             max_in_flight: threads.saturating_mul(2),
         }
     }
@@ -92,6 +100,7 @@ impl ParallelBlockLoader {
         self.fill_queue()?;
         let result = self.receive_next()?;
         self.delivered += 1;
+        self.spare_inputs.push(result.input);
         let block = result.block?;
         if block.address != address {
             return Err(io::Error::new(
@@ -103,8 +112,11 @@ impl ParallelBlockLoader {
             .expected_address
             .checked_add(block.size)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "BGZF offset overflow"))?;
-        self.fill_queue()?;
         Ok(block)
+    }
+
+    pub fn recycle_output(&mut self, output: Vec<u8>) {
+        self.spare_outputs.push(output);
     }
 
     fn fill_queue(&mut self) -> io::Result<()> {
@@ -112,13 +124,17 @@ impl ParallelBlockLoader {
             && self.next_read_address < self.file_len
         {
             let address = self.next_read_address;
-            let (compressed, size) = read_compressed_block(&mut self.file, self.file_len, address)?;
+            let input = self.spare_inputs.pop().unwrap_or_default();
+            let (compressed, size) =
+                read_compressed_block(&mut self.file, self.file_len, address, input)?;
+            let output = self.spare_outputs.pop().unwrap_or_default();
             self.senders[self.next_worker]
                 .send(DecompressJob {
                     sequence: self.submitted,
                     address,
                     size,
                     compressed,
+                    output,
                 })
                 .map_err(|_| io::Error::other("Parallel BGZF worker stopped unexpectedly"))?;
             self.next_worker = (self.next_worker + 1) % self.senders.len();

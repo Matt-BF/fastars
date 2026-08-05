@@ -44,6 +44,13 @@ impl FastaReader {
         }
     }
 
+    pub(crate) fn recycle_chunk(&mut self, chunk: FastaChunk) {
+        match self {
+            Self::Bgzf(reader) => reader.recycle_block(chunk.bytes),
+            Self::Plain(reader) => reader.recycle_chunk(chunk.bytes),
+        }
+    }
+
     pub(crate) fn seek(&mut self, offset: u64) -> io::Result<()> {
         match self {
             Self::Bgzf(reader) => reader.seek_virtual(offset),
@@ -67,6 +74,7 @@ impl FastaReader {
 pub(crate) struct PlainFastaReader {
     reader: BufReader<File>,
     position: u64,
+    spare_chunk: Vec<u8>,
 }
 
 impl PlainFastaReader {
@@ -74,12 +82,14 @@ impl PlainFastaReader {
         Ok(Self {
             reader: BufReader::new(File::open(path)?),
             position: 0,
+            spare_chunk: Vec::new(),
         })
     }
 
     fn read_chunk(&mut self) -> io::Result<Option<FastaChunk>> {
         let offset = self.position;
-        let mut bytes = vec![0_u8; PLAIN_CHUNK_SIZE];
+        let mut bytes = std::mem::take(&mut self.spare_chunk);
+        bytes.resize(PLAIN_CHUNK_SIZE, 0);
         let read = self.reader.read(&mut bytes)?;
         if read == 0 {
             return Ok(None);
@@ -90,6 +100,10 @@ impl PlainFastaReader {
             .checked_add(read as u64)
             .ok_or_else(|| io::Error::other("FASTA offset overflow"))?;
         Ok(Some(FastaChunk { offset, bytes }))
+    }
+
+    fn recycle_chunk(&mut self, bytes: Vec<u8>) {
+        self.spare_chunk = bytes;
     }
 
     fn seek(&mut self, offset: u64) -> io::Result<()> {

@@ -60,7 +60,11 @@ pub struct BgzfReader {
 }
 
 enum BlockLoader {
-    Serial(File),
+    Serial {
+        file: File,
+        spare_input: Vec<u8>,
+        spare_output: Vec<u8>,
+    },
     Parallel(ParallelBlockLoader),
 }
 
@@ -69,7 +73,11 @@ impl BgzfReader {
         let file = File::open(path)?;
         let file_len = file.metadata()?.len();
         Ok(Self {
-            loader: BlockLoader::Serial(file),
+            loader: BlockLoader::Serial {
+                file,
+                spare_input: Vec::new(),
+                spare_output: Vec::new(),
+            },
             file_len,
             block_address: 0,
             block_size: 0,
@@ -119,6 +127,13 @@ impl BgzfReader {
             address,
             bytes: std::mem::take(&mut self.block),
         }))
+    }
+
+    pub(crate) fn recycle_block(&mut self, bytes: Vec<u8>) {
+        match &mut self.loader {
+            BlockLoader::Serial { spare_output, .. } => *spare_output = bytes,
+            BlockLoader::Parallel(loader) => loader.recycle_output(bytes),
+        }
     }
 
     pub fn seek_virtual(&mut self, offset: u64) -> io::Result<()> {
@@ -209,13 +224,22 @@ impl BgzfReader {
 
     fn load_block(&mut self, address: u64) -> io::Result<()> {
         let loaded = match &mut self.loader {
-            BlockLoader::Serial(file) => {
-                let (compressed, size) = read_compressed_block(file, self.file_len, address)?;
-                LoadedBlock {
+            BlockLoader::Serial {
+                file,
+                spare_input,
+                spare_output,
+            } => {
+                let input = std::mem::take(spare_input);
+                let (compressed, size) =
+                    read_compressed_block(file, self.file_len, address, input)?;
+                let output = std::mem::take(spare_output);
+                let loaded = LoadedBlock {
                     address,
                     size,
-                    bytes: gzip_decompress(&compressed)?,
-                }
+                    bytes: gzip_decompress(&compressed, output)?,
+                };
+                *spare_input = compressed;
+                loaded
             }
             BlockLoader::Parallel(loader) => loader.load(address)?,
         };
@@ -231,6 +255,7 @@ fn read_compressed_block(
     file: &mut File,
     file_len: u64,
     address: u64,
+    mut compressed: Vec<u8>,
 ) -> io::Result<(Vec<u8>, u64)> {
     if address >= file_len {
         return Err(io::Error::new(
@@ -240,18 +265,19 @@ fn read_compressed_block(
     }
 
     file.seek(SeekFrom::Start(address))?;
-    let mut header = [0_u8; 12];
-    file.read_exact(&mut header)?;
-    if header[..4] != [31, 139, 8, 4] {
+    compressed.resize(12, 0);
+    file.read_exact(&mut compressed)?;
+    if compressed[..4] != [31, 139, 8, 4] {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "Input is not BGZF-compressed data",
         ));
     }
 
-    let extra_length = u16::from_le_bytes(header[10..12].try_into().unwrap()) as usize;
-    let mut extra = vec![0_u8; extra_length];
-    file.read_exact(&mut extra)?;
+    let extra_length = u16::from_le_bytes(compressed[10..12].try_into().unwrap()) as usize;
+    compressed.resize(12 + extra_length, 0);
+    file.read_exact(&mut compressed[12..])?;
+    let extra = &compressed[12..];
 
     let mut position = 0;
     let mut block_size = None;
@@ -273,7 +299,7 @@ fn read_compressed_block(
 
     let block_size = block_size
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Missing BGZF BC field"))?;
-    let prefix_len = header.len() + extra.len();
+    let prefix_len = compressed.len();
     let block_len = usize::try_from(block_size)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "BGZF block is too large"))?;
     if block_len < prefix_len || address.saturating_add(block_size) > file_len {
@@ -282,16 +308,13 @@ fn read_compressed_block(
             "Invalid BGZF block size",
         ));
     }
-    let mut compressed = Vec::with_capacity(block_len);
-    compressed.extend_from_slice(&header);
-    compressed.extend_from_slice(&extra);
     compressed.resize(block_len, 0);
     file.read_exact(&mut compressed[prefix_len..])?;
     Ok((compressed, block_size))
 }
 
-fn gzip_decompress(block: &[u8]) -> io::Result<Vec<u8>> {
-    let mut output = vec![0_u8; 65_536];
+fn gzip_decompress(block: &[u8], mut output: Vec<u8>) -> io::Result<Vec<u8>> {
+    output.resize(65_536, 0);
     let mut stream: ZStream = unsafe { zeroed() };
     stream.next_in = block.as_ptr() as *mut u8;
     stream.avail_in = block.len() as c_uint;

@@ -71,9 +71,13 @@ Wall time remained storage-bound during the comparison.
 
 ### 2. Reuse or replace BGZF decompression state
 
-Every BGZF block currently allocates compressed and decompressed buffers and
-initializes and destroys a zlib stream. Workers could instead retain their
-zlib state and recycle buffers between jobs.
+Compressed and decompressed buffers are now recycled through bounded worker
+pools. This reduced user CPU from 34.93 seconds to 33.30 seconds in a
+contemporaneous four-thread comparison, about 5%, with byte-identical output.
+
+Persistent zlib streams were tested but rejected because two runs increased
+user CPU to 37.63 and 37.51 seconds. Per-block zlib initialization is therefore
+retained.
 
 A separate experimental branch could benchmark `libdeflate` against zlib on
 METAVR. It introduces a dependency and should only be adopted if it produces a
@@ -151,7 +155,6 @@ access.
 Keep each item in a focused commit and benchmark it independently:
 
 1. Tune the GNU `sort` invocation for the spill path.
-2. Reuse decompression state and buffers.
-3. Benchmark `libdeflate` in an experimental branch.
-4. Revisit parallel block analysis only if parsing remains dominant.
-5. Change automatic thread defaults only after repeated measurements.
+2. Benchmark `libdeflate` in an experimental branch.
+3. Revisit parallel block analysis only if parsing remains dominant.
+4. Change automatic thread defaults only after repeated measurements.

@@ -71,3 +71,21 @@ CPU by another 10% while producing a byte-identical `.ffx` file.
 
 The shared filesystem dominated elapsed time during these runs, so user CPU is
 the more reliable measure of the parser improvement.
+
+## BGZF buffer-reuse result
+
+Recycling compressed and decompressed BGZF buffers produced the following
+contemporaneous four-thread comparison:
+
+| Buffer handling | Wall time (s) | User CPU (s) | Peak RSS (KiB) |
+| --- | ---: | ---: | ---: |
+| Allocate per block | 36.69 | 34.93 | 54,664 |
+| Recycle bounded buffers | 42.48 | 33.30 | 51,088 |
+
+The buffer pool reduced user CPU by about 5% and produced a byte-identical
+`.ffx`. Wall time again moved independently with shared-filesystem load.
+
+Keeping a zlib stream initialized in each worker was also tested, but rejected:
+two runs used 37.63 and 37.51 seconds of user CPU, roughly 8% more than the
+contemporaneous baseline. The committed implementation recycles buffers while
+retaining per-block zlib initialization.
