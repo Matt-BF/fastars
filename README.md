@@ -28,6 +28,10 @@ The executable is:
 target/release/fastars
 ```
 
+Tagged releases are built for Linux x86-64 and macOS on both Apple Silicon and
+Intel. See [the release process](docs/ai/release-process.md) for versioning and
+publishing instructions.
+
 ## Build an index
 
 The preferred path scans the BGZF-compressed or uncompressed FASTA directly:
