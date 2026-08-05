@@ -1,4 +1,6 @@
-use crate::fasta::{FastaLine, FastaReader};
+mod scanner;
+
+use crate::fasta::FastaReader;
 use crate::ffx::{IndexRecord, IndexStats, IndexWriter, read_u64};
 use std::error::Error;
 use std::fs::{self, File};
@@ -17,8 +19,8 @@ pub fn default_threads() -> usize {
         .unwrap_or(1)
 }
 
-#[derive(Clone, Copy)]
-struct RecordMetadata {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct RecordMetadata {
     virtual_offset: u64,
     sequence_length: u64,
     line_bases: u64,
@@ -34,30 +36,9 @@ pub fn build_index_from_fasta(
 ) -> Result<(), Box<dyn Error>> {
     let mut reader = FastaReader::with_threads(fasta_path, threads)?;
     let mut builder = IndexBuilder::new(output_path, temp_directory, sort_memory_bytes, threads)?;
-    let mut pending_header = None;
-
-    loop {
-        let header = match pending_header.take() {
-            Some(line) => line,
-            None => match reader.read_line()? {
-                Some(line) => line,
-                None => break,
-            },
-        };
-
-        if !header.bytes.starts_with(b">") {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Expected FASTA header line starting with '>'",
-            )
-            .into());
-        }
-
-        let full_id = parse_header_id(&header.bytes)?;
-        let (metadata, next_header) = read_record_metadata(&mut reader)?;
-        builder.add_record(&full_id, metadata)?;
-        pending_header = next_header;
-    }
+    scanner::scan_fasta(&mut reader, |full_id, metadata| {
+        builder.add_record(&full_id, metadata)
+    })?;
 
     drop(reader);
     builder.finish(output_path)?;
@@ -91,71 +72,7 @@ pub fn build_index_from_fai_gzi(
     Ok(())
 }
 
-fn read_record_metadata(
-    reader: &mut FastaReader,
-) -> io::Result<(RecordMetadata, Option<FastaLine>)> {
-    let mut sequence_offset = None;
-    let mut sequence_length = 0;
-    let mut line_bases = 0;
-    let mut line_width = 0;
-    let mut previous_bases = None;
-    let mut previous_width = None;
-
-    while let Some(line) = reader.read_line()? {
-        if line.bytes.starts_with(b">") {
-            let metadata =
-                finish_metadata(sequence_offset, sequence_length, line_bases, line_width)?;
-            return Ok((metadata, Some(line)));
-        }
-
-        let (bases, width) = sequence_line_layout(&line.bytes)?;
-        if bases == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Empty FASTA sequence lines are not supported",
-            ));
-        }
-
-        if let (Some(previous_bases), Some(previous_width)) = (previous_bases, previous_width)
-            && (previous_bases != line_bases || previous_width != line_width)
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Variable-width FASTA wrapping is not supported",
-            ));
-        }
-
-        if sequence_offset.is_none() {
-            sequence_offset = Some(line.offset);
-            line_bases = bases;
-            line_width = width;
-        }
-        sequence_length += bases;
-        previous_bases = Some(bases);
-        previous_width = Some(width);
-    }
-
-    let metadata = finish_metadata(sequence_offset, sequence_length, line_bases, line_width)?;
-    Ok((metadata, None))
-}
-
-fn finish_metadata(
-    sequence_offset: Option<u64>,
-    sequence_length: u64,
-    line_bases: u64,
-    line_width: u64,
-) -> io::Result<RecordMetadata> {
-    Ok(RecordMetadata {
-        virtual_offset: sequence_offset.ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "FASTA record has no sequence")
-        })?,
-        sequence_length,
-        line_bases,
-        line_width,
-    })
-}
-
-fn parse_header_id(bytes: &[u8]) -> io::Result<String> {
+pub(super) fn parse_header_id(bytes: &[u8]) -> io::Result<String> {
     let mut end = bytes.len();
     if end > 0 && bytes[end - 1] == b'\n' {
         end -= 1;
@@ -180,7 +97,7 @@ fn parse_header_id(bytes: &[u8]) -> io::Result<String> {
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Non-UTF-8 FASTA ID"))
 }
 
-fn sequence_line_layout(bytes: &[u8]) -> io::Result<(u64, u64)> {
+pub(super) fn sequence_line_layout(bytes: &[u8]) -> io::Result<(u64, u64)> {
     let mut base_len = bytes.len();
     if base_len > 0 && bytes[base_len - 1] == b'\n' {
         base_len -= 1;

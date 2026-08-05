@@ -61,24 +61,24 @@ fn uncompressed_bgzf_block(payload: &[u8]) -> Vec<u8> {
     block
 }
 
-fn read_all_lines(mut reader: BgzfReader) -> io::Result<Vec<(u64, Vec<u8>)>> {
-    let mut lines = Vec::new();
-    while let Some(line) = reader.read_line()? {
-        lines.push((line.start_virtual, line.bytes));
+fn read_all_blocks(mut reader: BgzfReader) -> io::Result<Vec<(u64, Vec<u8>)>> {
+    let mut blocks = Vec::new();
+    while let Some(block) = reader.read_block()? {
+        blocks.push((block.address, block.bytes));
     }
-    Ok(lines)
+    Ok(blocks)
 }
 
 #[test]
-fn parallel_reader_matches_serial_across_block_boundaries() {
+fn parallel_reader_matches_serial_blocks() {
     let path = test_path();
     let mut contents = uncompressed_bgzf_block(b">alpha\nACGT\n>be");
     contents.extend_from_slice(&uncompressed_bgzf_block(b"ta\nTT\n"));
     fs::write(&path, contents).unwrap();
 
-    let serial = read_all_lines(BgzfReader::new(&path).unwrap()).unwrap();
-    let single_threaded = read_all_lines(BgzfReader::with_threads(&path, 1).unwrap()).unwrap();
-    let parallel = read_all_lines(BgzfReader::with_threads(&path, 4).unwrap()).unwrap();
+    let serial = read_all_blocks(BgzfReader::new(&path).unwrap()).unwrap();
+    let single_threaded = read_all_blocks(BgzfReader::with_threads(&path, 1).unwrap()).unwrap();
+    let parallel = read_all_blocks(BgzfReader::with_threads(&path, 4).unwrap()).unwrap();
     assert_eq!(single_threaded, serial);
     assert_eq!(parallel, serial);
     assert_eq!(
@@ -86,25 +86,8 @@ fn parallel_reader_matches_serial_across_block_boundaries() {
             .iter()
             .map(|(_, bytes)| bytes.as_slice())
             .collect::<Vec<_>>(),
-        vec![
-            b">alpha\n".as_slice(),
-            b"ACGT\n".as_slice(),
-            b">beta\n".as_slice(),
-            b"TT\n".as_slice(),
-        ]
+        vec![b">alpha\nACGT\n>be".as_slice(), b"ta\nTT\n".as_slice(),]
     );
-
-    fs::remove_file(path).unwrap();
-}
-
-#[test]
-fn reader_returns_final_line_without_newline() {
-    let path = test_path();
-    fs::write(&path, uncompressed_bgzf_block(b">alpha\nACGT")).unwrap();
-
-    let lines = read_all_lines(BgzfReader::with_threads(&path, 2).unwrap()).unwrap();
-    assert_eq!(lines[0].1, b">alpha\n");
-    assert_eq!(lines[1].1, b"ACGT");
 
     fs::remove_file(path).unwrap();
 }

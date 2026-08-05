@@ -7,10 +7,9 @@ decompression, not in replacing the sorted `.ffx` lookup structure with a
 trie. Building the index must still read, decompress, and inspect the entire
 FASTA, and that work dominates the relatively small final index.
 
-The highest-priority next change is a block-aware FASTA scanner that avoids
-allocating and copying every sequence line. External-sort improvements become
-important when the ID records do not fit within the configured sort-memory
-budget.
+A block-aware FASTA scanner now avoids allocating and copying every sequence
+line. External-sort improvements become important when the ID records do not
+fit within the configured sort-memory budget.
 
 ## Benchmark input
 
@@ -66,8 +65,9 @@ A dedicated indexing scanner should:
 - Calculate sequence lengths and line wrapping while walking bytes once.
 - Preserve the current input validation and virtual-offset behavior.
 
-This is the most promising next optimization because its cost scales with the
-uncompressed sequence data rather than the number of indexed records.
+This change reduced user CPU from 36.75 seconds to 32.94 seconds in a
+four-thread sample run, about 10%, and produced a byte-identical `.ffx` file.
+Wall time remained storage-bound during the comparison.
 
 ### 2. Reuse or replace BGZF decompression state
 
@@ -150,9 +150,8 @@ access.
 
 Keep each item in a focused commit and benchmark it independently:
 
-1. Add the block-aware, near-zero-copy indexing scanner.
-2. Tune the GNU `sort` invocation for the spill path.
-3. Reuse decompression state and buffers.
-4. Benchmark `libdeflate` in an experimental branch.
-5. Revisit parallel block analysis only if parsing remains dominant.
-6. Change automatic thread defaults only after repeated measurements.
+1. Tune the GNU `sort` invocation for the spill path.
+2. Reuse decompression state and buffers.
+3. Benchmark `libdeflate` in an experimental branch.
+4. Revisit parallel block analysis only if parsing remains dominant.
+5. Change automatic thread defaults only after repeated measurements.

@@ -57,3 +57,17 @@ with the shared filesystem, while user CPU is stable.
 The block-slice implementation reduced user CPU by about 31%. Against the
 immediately following pre-change control, elapsed time fell by about 35%. The
 generated `.ffx` files were byte-identical.
+
+## Block-aware indexing scanner result
+
+The dedicated indexing scanner consumes decompressed BGZF blocks directly and
+copies only lines that cross a block boundary. A four-thread run reduced user
+CPU by another 10% while producing a byte-identical `.ffx` file.
+
+| Scanner | Wall time (s) | User CPU (s) | Peak RSS (KiB) |
+| --- | ---: | ---: | ---: |
+| Allocated line scan | 44.06 | 36.75 | 49,924 |
+| Block-aware index scan | 44.63 | 32.94 | 46,408 |
+
+The shared filesystem dominated elapsed time during these runs, so user CPU is
+the more reliable measure of the parser improvement.

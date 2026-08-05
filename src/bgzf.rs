@@ -44,8 +44,8 @@ unsafe extern "C" {
     fn inflateEnd(stream: *mut ZStream) -> c_int;
 }
 
-pub struct BgzfLine {
-    pub start_virtual: u64,
+pub(crate) struct BgzfBlock {
+    pub address: u64,
     pub bytes: Vec<u8>,
 }
 
@@ -101,31 +101,23 @@ impl BgzfReader {
         })
     }
 
-    pub fn read_line(&mut self) -> io::Result<Option<BgzfLine>> {
-        if !self.ensure_block()? {
+    pub(crate) fn read_block(&mut self) -> io::Result<Option<BgzfBlock>> {
+        let address = if self.started {
+            self.block_address
+                .checked_add(self.block_size)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "BGZF offset overflow"))?
+        } else {
+            0
+        };
+        if address >= self.file_len {
             return Ok(None);
         }
-        let start_virtual = (self.block_address << 16) | self.position as u64;
-        let mut bytes = Vec::new();
 
-        loop {
-            if !self.ensure_block()? {
-                break;
-            }
-            let remaining = &self.block[self.position..];
-            if let Some(newline) = memchr::memchr(b'\n', remaining) {
-                let end = self.position + newline + 1;
-                bytes.extend_from_slice(&self.block[self.position..end]);
-                self.position = end;
-                break;
-            }
-            bytes.extend_from_slice(remaining);
-            self.position = self.block.len();
-        }
-
-        Ok(Some(BgzfLine {
-            start_virtual,
-            bytes,
+        self.load_block(address)?;
+        self.started = true;
+        Ok(Some(BgzfBlock {
+            address,
+            bytes: std::mem::take(&mut self.block),
         }))
     }
 

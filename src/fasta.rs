@@ -1,9 +1,11 @@
-use crate::bgzf::{BgzfLine, BgzfReader};
+use crate::bgzf::BgzfReader;
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
+use std::io::{self, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
-pub(crate) struct FastaLine {
+const PLAIN_CHUNK_SIZE: usize = 1024 * 1024;
+
+pub(crate) struct FastaChunk {
     pub offset: u64,
     pub bytes: Vec<u8>,
 }
@@ -30,10 +32,15 @@ impl FastaReader {
         Ok(Self::Plain(PlainFastaReader::new(path)?))
     }
 
-    pub(crate) fn read_line(&mut self) -> io::Result<Option<FastaLine>> {
+    pub(crate) fn read_chunk(&mut self) -> io::Result<Option<FastaChunk>> {
         match self {
-            Self::Bgzf(reader) => reader.read_line().map(|line| line.map(FastaLine::from)),
-            Self::Plain(reader) => reader.read_line(),
+            Self::Bgzf(reader) => reader.read_block().map(|block| {
+                block.map(|block| FastaChunk {
+                    offset: block.address << 16,
+                    bytes: block.bytes,
+                })
+            }),
+            Self::Plain(reader) => reader.read_chunk(),
         }
     }
 
@@ -57,15 +64,6 @@ impl FastaReader {
     }
 }
 
-impl From<BgzfLine> for FastaLine {
-    fn from(line: BgzfLine) -> Self {
-        Self {
-            offset: line.start_virtual,
-            bytes: line.bytes,
-        }
-    }
-}
-
 pub(crate) struct PlainFastaReader {
     reader: BufReader<File>,
     position: u64,
@@ -79,18 +77,19 @@ impl PlainFastaReader {
         })
     }
 
-    fn read_line(&mut self) -> io::Result<Option<FastaLine>> {
+    fn read_chunk(&mut self) -> io::Result<Option<FastaChunk>> {
         let offset = self.position;
-        let mut bytes = Vec::new();
-        let read = self.reader.read_until(b'\n', &mut bytes)?;
+        let mut bytes = vec![0_u8; PLAIN_CHUNK_SIZE];
+        let read = self.reader.read(&mut bytes)?;
         if read == 0 {
             return Ok(None);
         }
+        bytes.truncate(read);
         self.position = self
             .position
             .checked_add(read as u64)
             .ok_or_else(|| io::Error::other("FASTA offset overflow"))?;
-        Ok(Some(FastaLine { offset, bytes }))
+        Ok(Some(FastaChunk { offset, bytes }))
     }
 
     fn seek(&mut self, offset: u64) -> io::Result<()> {
@@ -163,12 +162,11 @@ mod tests {
         fs::write(&path, b">alpha description\nACGT\nAC\n>beta\nTT\n").unwrap();
 
         let mut reader = FastaReader::with_threads(&path, 4).unwrap();
-        let header = reader.read_line().unwrap().unwrap();
-        let sequence = reader.read_line().unwrap().unwrap();
-        assert_eq!(header.offset, 0);
-        assert_eq!(sequence.offset, 19);
+        let chunk = reader.read_chunk().unwrap().unwrap();
+        assert_eq!(chunk.offset, 0);
+        assert_eq!(chunk.bytes, b">alpha description\nACGT\nAC\n>beta\nTT\n");
 
-        reader.seek(sequence.offset).unwrap();
+        reader.seek(19).unwrap();
         assert_eq!(reader.read_sequence(6, 4, 5).unwrap(), b"ACGTAC");
 
         fs::remove_file(path).unwrap();
