@@ -6,7 +6,7 @@ to standard output, so it fits directly into shell pipelines.
 
 Use `fastars index` to build an index and `fastars fetch` to retrieve records.
 
-## Requirements
+## Requirements if building from source
 
 - Rust and Cargo to build the program.
 - A C compiler for the bundled zstd library.
@@ -29,9 +29,7 @@ target/release/fastars
 ```
 
 Tagged releases are built for Linux x86-64 and macOS on both Apple Silicon and
-Intel. Push a tag matching the version in `Cargo.toml`, such as `v0.1.0`, to
-publish the archives on the GitHub Releases page. Manual workflow runs produce
-temporary artifacts on the Actions run without publishing a release.
+Intel.
 
 ## Build an index
 
@@ -41,9 +39,8 @@ The preferred path scans the BGZF-compressed or uncompressed FASTA directly:
 fastars index --fasta sequences.fna.bgz
 ```
 
-Up to 512 MiB is used for an in-memory ID sort by default. Set
-`--sort-memory <MiB>` to change the budget; larger indexes automatically fall
-back to a platform-independent external merge sort in `--temp-directory`.
+Set `--sort-memory <MiB>` to change the budget; larger indexes automatically fall
+back to a platform-independent external merge sort in `--temp-directory`. Up to 512 MiB is used for an in-memory ID sort by default. 
 Temporary records are stored in compact binary runs, with each sort run bounded
 by the requested memory budget. BGZF decompression and block encoding use all
 available CPUs by default; use `--threads <N>` to set the worker count.
