@@ -86,17 +86,16 @@ meaningful measured improvement.
 ### 3. Improve the external-sort path
 
 When records exceed the in-memory budget, fastars writes textual temporary
-records and invokes GNU `sort`. The current `--sort-memory` value determines
-when spilling starts, but is not explicitly passed to GNU `sort` with `-S`.
-The configured thread count is also not passed with `--parallel`.
+records and invokes GNU `sort`. The configured memory and thread limits are now
+passed to GNU `sort` explicitly. In a 16 MiB forced-spill comparison, this
+reduced peak RSS from 50,784 KiB to 24,960 KiB and user CPU from 33.95 seconds
+to 32.86 seconds. Wall time remained dominated by shared-filesystem variance.
 
 The improvements can be staged:
 
-1. Pass explicit memory and thread limits to GNU `sort`, then benchmark the
-   spill path.
-2. Replace textual temporary records with a compact binary representation to
+1. Replace textual temporary records with a compact binary representation to
    reduce formatting, parsing, and temporary I/O.
-3. If sorting remains significant, radix-partition IDs into memory-sized runs
+2. If sorting remains significant, radix-partition IDs into memory-sized runs
    and merge or concatenate the partitions in lexical order.
 
 For the full METAVR file, a larger budget such as `--sort-memory 4096` is
@@ -154,7 +153,7 @@ access.
 
 Keep each item in a focused commit and benchmark it independently:
 
-1. Tune the GNU `sort` invocation for the spill path.
-2. Benchmark `libdeflate` in an experimental branch.
+1. Benchmark `libdeflate` in an experimental branch.
+2. Replace textual spill records only if full-file sorting remains material.
 3. Revisit parallel block analysis only if parsing remains dominant.
 4. Change automatic thread defaults only after repeated measurements.

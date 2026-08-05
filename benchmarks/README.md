@@ -89,3 +89,17 @@ Keeping a zlib stream initialized in each worker was also tested, but rejected:
 two runs used 37.63 and 37.51 seconds of user CPU, roughly 8% more than the
 contemporaneous baseline. The committed implementation recycles buffers while
 retaining per-block zlib initialization.
+
+## External-sort resource result
+
+The spill path now passes `--sort-memory` and `--threads` through to GNU
+`sort`. A 16 MiB forced-spill comparison produced byte-identical indexes:
+
+| GNU sort configuration | Wall time (s) | User CPU (s) | Peak RSS (KiB) |
+| --- | ---: | ---: | ---: |
+| Implicit defaults | 27.06 | 33.95 | 50,784 |
+| Explicit 16 MiB, 4 threads | 38.01 | 32.86 | 24,960 |
+
+The explicit limit roughly halved peak RSS and modestly reduced CPU. Wall time
+remains too sensitive to shared-filesystem load to claim an elapsed-time gain
+from this single comparison.

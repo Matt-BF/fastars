@@ -39,9 +39,9 @@ fastars index --fasta sequences.fna.bgz
 
 Up to 512 MiB is used for an in-memory ID sort by default. Set
 `--sort-memory <MiB>` to change the budget; larger indexes automatically fall
-back to an external sort in `--temp-directory`. BGZF decompression and block
-encoding use all available CPUs by default; use `--threads <N>` to set the
-worker count.
+back to an external sort in `--temp-directory`. The external sorter receives
+the same memory and thread limits. BGZF decompression and block encoding use
+all available CPUs by default; use `--threads <N>` to set the worker count.
 
 This writes:
 

@@ -11,6 +11,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const DEFAULT_SORT_MEMORY_MIB: usize = 512;
+const MIN_EXTERNAL_SORT_MEMORY: usize = 1024 * 1024;
 static NEXT_TEMPORARY_FILE: AtomicU64 = AtomicU64::new(0);
 
 pub fn default_threads() -> usize {
@@ -285,15 +286,7 @@ impl IndexBuilder {
             )?);
         }
 
-        let mut sort = Command::new("sort");
-        sort.env("LC_ALL", "C")
-            .arg("-t")
-            .arg("\t")
-            .arg("-k1,1")
-            .arg("-s");
-        if let Some(directory) = &self.temp_directory {
-            sort.arg("-T").arg(directory);
-        }
+        let mut sort = self.external_sort_command();
         let mut child = sort
             .arg(&self.sort_input_path)
             .stdout(Stdio::piped())
@@ -313,6 +306,22 @@ impl IndexBuilder {
             return Err(io::Error::other("sort failed while building .ffx").into());
         }
         Ok(write_result?)
+    }
+
+    fn external_sort_command(&self) -> Command {
+        let mut sort = Command::new("sort");
+        let memory_bytes = self.sort_memory_bytes.max(MIN_EXTERNAL_SORT_MEMORY);
+        sort.env("LC_ALL", "C")
+            .arg("-t")
+            .arg("\t")
+            .arg("-k1,1")
+            .arg("-s")
+            .arg(format!("--buffer-size={memory_bytes}b"))
+            .arg(format!("--parallel={}", self.threads));
+        if let Some(directory) = &self.temp_directory {
+            sort.arg("-T").arg(directory);
+        }
+        sort
     }
 }
 
@@ -613,5 +622,21 @@ mod tests {
         drop(builder);
         assert!(!input.exists());
         fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn external_sort_uses_configured_resources() {
+        let output = test_path("external-sort-options.ffx");
+        let builder =
+            IndexBuilder::new(output.to_str().unwrap(), Some("/tmp"), 8 * 1024 * 1024, 3).unwrap();
+        let command = builder.external_sort_command();
+        let arguments = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert!(arguments.contains(&"--buffer-size=8388608b".to_string()));
+        assert!(arguments.contains(&"--parallel=3".to_string()));
+        assert!(arguments.windows(2).any(|pair| pair == ["-T", "/tmp"]));
     }
 }
