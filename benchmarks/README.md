@@ -90,10 +90,11 @@ two runs used 37.63 and 37.51 seconds of user CPU, roughly 8% more than the
 contemporaneous baseline. The committed implementation recycles buffers while
 retaining per-block zlib initialization.
 
-## External-sort resource result
+## GNU external-sort resource result (historical)
 
-The spill path now passes `--sort-memory` and `--threads` through to GNU
-`sort`. A 16 MiB forced-spill comparison produced byte-identical indexes:
+Before the Rust sorter replacement, the spill path passed `--sort-memory` and
+`--threads` through to GNU `sort`. A 16 MiB forced-spill comparison produced
+byte-identical indexes:
 
 | GNU sort configuration | Wall time (s) | User CPU (s) | Peak RSS (KiB) |
 | --- | ---: | ---: | ---: |
@@ -103,3 +104,22 @@ The spill path now passes `--sort-memory` and `--threads` through to GNU
 The explicit limit roughly halved peak RSS and modestly reduced CPU. Wall time
 remains too sensitive to shared-filesystem load to claim an elapsed-time gain
 from this single comparison.
+
+## Platform-independent external sort
+
+GNU `sort` was subsequently replaced with an in-process stable external merge
+sort. The Rust implementation writes compact binary runs, merges at most 64
+runs at once, and adds merge passes when necessary to keep file descriptor use
+bounded.
+
+The same 16 MiB forced-spill workload produced:
+
+| Sorter | Wall time (s) | User CPU (s) | System CPU (s) | Peak RSS (KiB) |
+| --- | ---: | ---: | ---: | ---: |
+| GNU sort | 38.01 | 32.86 | 1.36 | 24,960 |
+| Rust external merge | 7.90 | 34.52 | 0.69 | 29,988 |
+
+Both produced the same `.ffx` SHA-256,
+`22d91a1fedea76103e67dcd5a189a4a596a51d3cfbd556b042b3d6af181b6aab`.
+The Rust sorter used about 5% more user CPU and 5 MiB more peak memory. Its wall
+time benefited from a warmer input cache and is not directly comparable.

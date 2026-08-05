@@ -85,18 +85,19 @@ meaningful measured improvement.
 
 ### 3. Improve the external-sort path
 
-When records exceed the in-memory budget, fastars writes textual temporary
-records and invokes GNU `sort`. The configured memory and thread limits are now
-passed to GNU `sort` explicitly. In a 16 MiB forced-spill comparison, this
-reduced peak RSS from 50,784 KiB to 24,960 KiB and user CPU from 33.95 seconds
-to 32.86 seconds. Wall time remained dominated by shared-filesystem variance.
+When records exceed the in-memory budget, fastars now performs its own stable
+external merge sort. It writes compact binary, memory-sized sorted runs and
+merges at most 64 files at once. Additional merge passes bound file descriptor
+use for very large indexes. This removes the GNU `sort` platform dependency
+while preserving lexical order and duplicate input order.
 
-The improvements can be staged:
+On the 16 MiB forced-spill sample, the Rust sorter used 34.52 seconds of user
+CPU and 29,988 KiB peak RSS, compared with 32.86 seconds and 24,960 KiB for GNU
+sort. The approximately 5% CPU and 5 MiB memory costs are accepted in exchange
+for portability. Both paths produced byte-identical `.ffx` output.
 
-1. Replace textual temporary records with a compact binary representation to
-   reduce formatting, parsing, and temporary I/O.
-2. If sorting remains significant, radix-partition IDs into memory-sized runs
-   and merge or concatenate the partitions in lexical order.
+If sorting remains significant on the full dataset, radix partitioning could
+reduce comparison work while retaining the same on-disk `.ffx` order.
 
 For the full METAVR file, a larger budget such as `--sort-memory 4096` is
 expected to keep the projected 8-9 million index records in memory, subject to
@@ -154,6 +155,6 @@ access.
 Keep each item in a focused commit and benchmark it independently:
 
 1. Benchmark `libdeflate` in an experimental branch.
-2. Replace textual spill records only if full-file sorting remains material.
+2. Consider radix partitioning only if full-file sorting remains material.
 3. Revisit parallel block analysis only if parsing remains dominant.
 4. Change automatic thread defaults only after repeated measurements.

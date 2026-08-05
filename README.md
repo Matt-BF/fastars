@@ -12,7 +12,6 @@ Use `fastars index` to build an index and `fastars fetch` to retrieve records.
 - The system zstd library and `pkg-config` to build compressed index support.
 - A BGZF-compressed (`.bgz`) or uncompressed FASTA. Plain gzip and zstd
   compression are not supported.
-- The system `sort` command to build an `.ffx` index.
 
 Fetch does not require `.fai` or `.gzi` files. Those files are only optional
 inputs for building `.ffx` faster when they already exist.
@@ -39,9 +38,10 @@ fastars index --fasta sequences.fna.bgz
 
 Up to 512 MiB is used for an in-memory ID sort by default. Set
 `--sort-memory <MiB>` to change the budget; larger indexes automatically fall
-back to an external sort in `--temp-directory`. The external sorter receives
-the same memory and thread limits. BGZF decompression and block encoding use
-all available CPUs by default; use `--threads <N>` to set the worker count.
+back to a platform-independent external merge sort in `--temp-directory`.
+Temporary records are stored in compact binary runs, with each sort run bounded
+by the requested memory budget. BGZF decompression and block encoding use all
+available CPUs by default; use `--threads <N>` to set the worker count.
 
 This writes:
 
