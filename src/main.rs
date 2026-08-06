@@ -4,6 +4,7 @@ mod ffx;
 mod indexer;
 mod progress;
 
+use crate::bgzf::BgzfWriter;
 use crate::fasta::FastaReader;
 use crate::ffx::{FfxIndex, FfxRecord};
 use crate::indexer::{
@@ -52,6 +53,12 @@ struct IndexArgs {
     show_progress: bool,
 }
 
+struct GenerateArgs {
+    output: String,
+    number_sequences: u64,
+    number_bases: u64,
+}
+
 fn usage() -> &'static str {
     r#"fastars — fast random retrieval from BGZF-compressed or plain FASTA files
 
@@ -59,10 +66,12 @@ USAGE:
     fastars fetch --fasta <FASTA.bgz> [OPTIONS] [ID ...]
     fastars index --fasta <FASTA.bgz> [OPTIONS]
     fastars index --fai <FASTA.bgz.fai> --gzi <FASTA.bgz.gzi> [OPTIONS]
+    fastars generate --output <FASTA.bgz> --number-seqs <N> --number-bases <N>
 
 COMMANDS:
     fetch    Fetch FASTA records by exact ID, prefix, partial text, or regular expression.
     index    Build a compressed, self-contained .ffx index.
+    generate Generate a deterministic BGZF FASTA benchmark fixture.
 
 FETCH OPTIONS:
     --fasta <FILE>             BGZF-compressed or plain FASTA. Required.
@@ -95,6 +104,22 @@ The .ffx stores full IDs, FASTA offsets, sequence lengths, and line layout.
 Fetching needs only the FASTA and .ffx; .fai/.gzi files are not
 read during fetch. Use --id-mode prefix for prefix queries, --id-mode partial
 for literal substring queries, or --id-regexp for regular-expression queries.
+"#
+}
+
+fn generate_usage() -> &'static str {
+    r#"fastars generate — create a deterministic BGZF FASTA benchmark fixture
+
+USAGE:
+    fastars generate --output <FASTA.bgz> --number-seqs <N> --number-bases <N>
+
+OPTIONS:
+    -o, --output <FILE>        BGZF FASTA output path. Required.
+    --ns, --number-seqs <N>    Number of sequences. Required.
+    --nbp, --number-bases <N>  Bases in every sequence. Required.
+    -h, --help                 Print this help message.
+
+Records are named seqid_1 through seqid_N. Sequence bases are deterministic.
 "#
 }
 
@@ -304,6 +329,52 @@ fn parse_index_args() -> Result<IndexArgs, String> {
     })
 }
 
+fn parse_generate_args() -> Result<GenerateArgs, String> {
+    let mut output = None;
+    let mut number_sequences = None;
+    let mut number_bases = None;
+    let mut arguments = env::args().skip(2);
+
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "-o" | "--output" => output = arguments.next(),
+            "--ns" | "--number-seqs" => number_sequences = arguments.next(),
+            "--nbp" | "--number-bases" => number_bases = arguments.next(),
+            "-h" | "--help" => {
+                println!("{}", generate_usage());
+                std::process::exit(0);
+            }
+            _ => {
+                return Err(format!(
+                    "Unknown generate option: {argument}\n\n{}",
+                    generate_usage()
+                ));
+            }
+        }
+    }
+
+    Ok(GenerateArgs {
+        output: output.ok_or_else(|| format!("--output is required\n\n{}", generate_usage()))?,
+        number_sequences: parse_positive_count(
+            number_sequences,
+            "--number-seqs",
+            generate_usage(),
+        )?,
+        number_bases: parse_positive_count(number_bases, "--number-bases", generate_usage())?,
+    })
+}
+
+fn parse_positive_count(value: Option<String>, option: &str, help: &str) -> Result<u64, String> {
+    let value = value.ok_or_else(|| format!("{option} is required\n\n{help}"))?;
+    let value = value
+        .parse::<u64>()
+        .map_err(|_| format!("{option} must be a positive integer\n\n{help}"))?;
+    if value == 0 {
+        return Err(format!("{option} must be a positive integer\n\n{help}"));
+    }
+    Ok(value)
+}
+
 fn read_query_ids(arguments: &FetchArgs) -> io::Result<Vec<String>> {
     let mut ids = arguments
         .ids
@@ -400,6 +471,53 @@ fn run_index_command() -> Result<(), Box<dyn Error>> {
 
     eprintln!("Wrote {output}");
     Ok(())
+}
+
+fn run_generate_command() -> Result<(), Box<dyn Error>> {
+    let arguments = parse_generate_args().map_err(io::Error::other)?;
+    generate_fasta(
+        &arguments.output,
+        arguments.number_sequences,
+        arguments.number_bases,
+    )?;
+    eprintln!("Wrote {}", arguments.output);
+    Ok(())
+}
+
+fn generate_fasta(output: &str, number_sequences: u64, number_bases: u64) -> io::Result<()> {
+    let mut writer = BgzfWriter::new(output)?;
+    for sequence_number in 1..=number_sequences {
+        writeln!(writer, ">seqid_{sequence_number}")?;
+        write_generated_sequence(&mut writer, sequence_number, number_bases)?;
+    }
+    writer.finish()
+}
+
+fn write_generated_sequence(
+    writer: &mut BgzfWriter,
+    sequence_number: u64,
+    number_bases: u64,
+) -> io::Result<()> {
+    let mut bases = [b'A'; 8_192];
+    let mut state = sequence_number;
+    let mut remaining = number_bases;
+    while remaining > 0 {
+        let count = remaining.min(bases.len() as u64) as usize;
+        for base in &mut bases[..count] {
+            *base = b"ACGT"[next_random(&mut state) as usize];
+        }
+        writer.write_all(&bases[..count])?;
+        remaining -= count as u64;
+    }
+    writer.write_all(b"\n")
+}
+
+fn next_random(state: &mut u64) -> u8 {
+    *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    let mut value = *state;
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    ((value ^ (value >> 31)) & 3) as u8
 }
 
 fn run_fetch_command() -> Result<(), Box<dyn Error>> {
@@ -531,6 +649,7 @@ fn main() {
     let result = match first_argument.as_deref() {
         Some("fetch") => run_fetch_command(),
         Some("index") => run_index_command(),
+        Some("generate") => run_generate_command(),
         Some(command) => {
             Err(io::Error::other(format!("Unknown command: {command}\n\n{}", usage())).into())
         }
@@ -546,6 +665,19 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_PATH: AtomicU64 = AtomicU64::new(0);
+
+    fn test_path(suffix: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "fastars-generate-{}-{}-{suffix}",
+            std::process::id(),
+            NEXT_PATH.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
 
     #[test]
     fn query_normalization_preserves_complete_headers() {
@@ -556,5 +688,38 @@ mod tests {
             normalize_query("  >description with spaces  ", IdMode::Partial),
             "description with spaces"
         );
+    }
+
+    #[test]
+    fn generated_fasta_is_indexable() {
+        let fasta = test_path("fixture.fna.bgz");
+        let index_path = test_path("fixture.fna.bgz.ffx");
+        generate_fasta(fasta.to_str().unwrap(), 3, 65_281).unwrap();
+        build_index_from_fasta(
+            fasta.to_str().unwrap(),
+            index_path.to_str().unwrap(),
+            None,
+            1024 * 1024,
+            2,
+            false,
+        )
+        .unwrap();
+
+        let mut index = FfxIndex::open(index_path.to_str().unwrap()).unwrap();
+        let record = index.find_exact("seqid_2").unwrap().pop().unwrap();
+        assert_eq!(record.sequence_length, 65_281);
+
+        let mut reader = FastaReader::new(&fasta).unwrap();
+        reader.seek(record.virtual_offset).unwrap();
+        let sequence = reader
+            .read_sequence(record.sequence_length, record.line_bases, record.line_width)
+            .unwrap();
+        assert_eq!(sequence.len(), 65_281);
+        for base in b"ACGT" {
+            assert!(sequence.contains(base));
+        }
+
+        fs::remove_file(fasta).unwrap();
+        fs::remove_file(index_path).unwrap();
     }
 }

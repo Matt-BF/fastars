@@ -5,13 +5,19 @@ mod tests;
 use parallel::{LoadedBlock, ParallelBlockLoader};
 use std::ffi::c_void;
 use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::mem::{size_of, zeroed};
 use std::os::raw::{c_char, c_int, c_uint, c_ulong};
 use std::path::Path;
 
 const Z_STREAM_END: c_int = 1;
 const Z_FINISH: c_int = 4;
+const Z_DEFLATED: c_int = 8;
+const Z_DEFAULT_STRATEGY: c_int = 0;
+const BGZF_BLOCK_PAYLOAD_SIZE: usize = 65_280;
+const BGZF_EOF_BLOCK: [u8; 28] = [
+    31, 139, 8, 4, 0, 0, 0, 0, 0, 255, 6, 0, 66, 67, 2, 0, 27, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+];
 
 #[repr(C)]
 struct ZStream {
@@ -42,6 +48,19 @@ unsafe extern "C" {
     ) -> c_int;
     fn inflate(stream: *mut ZStream, flush: c_int) -> c_int;
     fn inflateEnd(stream: *mut ZStream) -> c_int;
+    fn deflateInit2_(
+        stream: *mut ZStream,
+        level: c_int,
+        method: c_int,
+        window_bits: c_int,
+        memory_level: c_int,
+        strategy: c_int,
+        version: *const c_char,
+        stream_size: c_int,
+    ) -> c_int;
+    fn deflate(stream: *mut ZStream, flush: c_int) -> c_int;
+    fn deflateEnd(stream: *mut ZStream) -> c_int;
+    fn crc32(crc: c_ulong, buffer: *const u8, length: c_uint) -> c_ulong;
 }
 
 pub(crate) struct BgzfBlock {
@@ -57,6 +76,87 @@ pub struct BgzfReader {
     block: Vec<u8>,
     position: usize,
     started: bool,
+}
+
+pub(crate) struct BgzfWriter {
+    file: BufWriter<File>,
+    buffer: Vec<u8>,
+}
+
+impl BgzfWriter {
+    pub(crate) fn new<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+        Ok(Self {
+            file: BufWriter::new(File::create(path)?),
+            buffer: Vec::with_capacity(BGZF_BLOCK_PAYLOAD_SIZE),
+        })
+    }
+
+    pub(crate) fn finish(mut self) -> io::Result<()> {
+        self.flush_block()?;
+        self.file.write_all(&BGZF_EOF_BLOCK)?;
+        self.file.flush()
+    }
+
+    fn flush_block(&mut self) -> io::Result<()> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+        let compressed = raw_deflate(&self.buffer)?;
+        let block_size = 18_usize
+            .checked_add(compressed.len())
+            .and_then(|size| size.checked_add(8))
+            .and_then(|size| u16::try_from(size).ok())
+            .ok_or_else(|| io::Error::other("Generated BGZF block is too large"))?;
+        let stored_size = (block_size - 1).to_le_bytes();
+        self.file.write_all(&[
+            31,
+            139,
+            8,
+            4,
+            0,
+            0,
+            0,
+            0,
+            0,
+            255,
+            6,
+            0,
+            66,
+            67,
+            2,
+            0,
+            stored_size[0],
+            stored_size[1],
+        ])?;
+        self.file.write_all(&compressed)?;
+        let checksum = unsafe { crc32(0, self.buffer.as_ptr(), self.buffer.len() as c_uint) };
+        self.file.write_all(&(checksum as u32).to_le_bytes())?;
+        self.file
+            .write_all(&(self.buffer.len() as u32).to_le_bytes())?;
+        self.buffer.clear();
+        Ok(())
+    }
+}
+
+impl Write for BgzfWriter {
+    fn write(&mut self, mut bytes: &[u8]) -> io::Result<usize> {
+        let input_len = bytes.len();
+        while !bytes.is_empty() {
+            let available = BGZF_BLOCK_PAYLOAD_SIZE - self.buffer.len();
+            let count = available.min(bytes.len());
+            self.buffer.extend_from_slice(&bytes[..count]);
+            bytes = &bytes[count..];
+            if self.buffer.len() == BGZF_BLOCK_PAYLOAD_SIZE {
+                self.flush_block()?;
+            }
+        }
+        Ok(input_len)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.flush_block()?;
+        self.file.flush()
+    }
 }
 
 enum BlockLoader {
@@ -357,6 +457,40 @@ fn gzip_decompress(block: &[u8], mut output: Vec<u8>) -> io::Result<Vec<u8>> {
             io::ErrorKind::InvalidData,
             "Could not decompress BGZF block",
         ));
+    }
+
+    output.truncate(stream.total_out as usize);
+    Ok(output)
+}
+
+fn raw_deflate(input: &[u8]) -> io::Result<Vec<u8>> {
+    let mut output = vec![0_u8; input.len() + 64];
+    let mut stream: ZStream = unsafe { zeroed() };
+    stream.next_in = input.as_ptr() as *mut u8;
+    stream.avail_in = input.len() as c_uint;
+    stream.next_out = output.as_mut_ptr();
+    stream.avail_out = output.len() as c_uint;
+
+    let initialized = unsafe {
+        deflateInit2_(
+            &mut stream,
+            6,
+            Z_DEFLATED,
+            -15,
+            8,
+            Z_DEFAULT_STRATEGY,
+            zlibVersion(),
+            size_of::<ZStream>() as c_int,
+        )
+    };
+    if initialized != 0 {
+        return Err(io::Error::other("Could not initialize zlib compression"));
+    }
+
+    let result = unsafe { deflate(&mut stream, Z_FINISH) };
+    unsafe { deflateEnd(&mut stream) };
+    if result != Z_STREAM_END {
+        return Err(io::Error::other("Could not compress BGZF block"));
     }
 
     output.truncate(stream.total_out as usize);
