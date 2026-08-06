@@ -172,18 +172,23 @@ impl FfxIndex {
             .build(patterns)
             .map_err(io::Error::other)?;
         let mut matches = vec![Vec::new(); queries.len()];
-        let mut matched_patterns = vec![false; pattern_queries.len()];
+        let mut pattern_stamps = vec![0_usize; pattern_queries.len()];
+        let mut record_stamp = 0_usize;
         for block_index in 0..self.directory.len() {
             for record in self.read_block(block_index)? {
-                matched_patterns.fill(false);
-                for matched in matcher.find_overlapping_iter(&record.header) {
-                    matched_patterns[matched.pattern().as_usize()] = true;
+                if record_stamp == usize::MAX {
+                    pattern_stamps.fill(0);
+                    record_stamp = 0;
                 }
-                for (pattern_index, matched) in matched_patterns.iter().enumerate() {
-                    if *matched {
-                        for query_index in &pattern_queries[pattern_index] {
-                            matches[*query_index].push(record.clone());
-                        }
+                record_stamp += 1;
+                for matched in matcher.find_overlapping_iter(&record.header) {
+                    let pattern_index = matched.pattern().as_usize();
+                    if pattern_stamps[pattern_index] == record_stamp {
+                        continue;
+                    }
+                    pattern_stamps[pattern_index] = record_stamp;
+                    for query_index in &pattern_queries[pattern_index] {
+                        matches[*query_index].push(record.clone());
                     }
                 }
             }
@@ -301,11 +306,13 @@ mod tests {
             "second description".to_string(),
             "PREFIX-".to_string(),
             "second description".to_string(),
+            "i".to_string(),
         ];
         let partial = index.find_partial_many(&partial_queries, true).unwrap();
         assert_eq!(partial[0].len(), 1);
         assert_eq!(partial[1].len(), 2);
         assert_eq!(partial[2], partial[0]);
+        assert_eq!(partial[3].len(), 5);
         let exact_queries = vec!["DUPLICATE SECOND DESCRIPTION".to_string()];
         let exact = index
             .find_scan_many(&exact_queries, |record, query| {
