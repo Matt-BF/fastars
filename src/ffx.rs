@@ -65,10 +65,10 @@ impl FfxIndex {
         while block_index < self.directory.len() {
             let records = self.read_block(block_index)?;
             let start = records.partition_point(|record| record.full_id.as_str() < id);
-            for record in records.into_iter().skip(start) {
+            for record in records.iter().skip(start) {
                 match record.full_id.as_str().cmp(id) {
                     Ordering::Less => continue,
-                    Ordering::Equal => matches.push(record),
+                    Ordering::Equal => matches.push(record.clone()),
                     Ordering::Greater => return Ok(matches),
                 }
             }
@@ -90,9 +90,9 @@ impl FfxIndex {
         while block_index < self.directory.len() {
             let records = self.read_block(block_index)?;
             let start = records.partition_point(|record| record.full_id.as_str() < id_prefix);
-            for record in records.into_iter().skip(start) {
+            for record in records.iter().skip(start) {
                 if record.full_id.starts_with(id_prefix) {
-                    matches.push(record);
+                    matches.push(record.clone());
                 } else {
                     return Ok(matches);
                 }
@@ -118,7 +118,7 @@ impl FfxIndex {
         for block_index in 0..self.directory.len() {
             for record in self.read_block(block_index)? {
                 if regex.is_match(&record.header) != invert {
-                    visit(record)?;
+                    visit(record.clone())?;
                 }
             }
         }
@@ -137,7 +137,7 @@ impl FfxIndex {
         for block_index in 0..self.directory.len() {
             for record in self.read_block(block_index)? {
                 for (query_index, query) in queries.iter().enumerate() {
-                    if predicate(&record, query) {
+                    if predicate(record, query) {
                         matches[query_index].push(record.clone());
                     }
                 }
@@ -201,28 +201,30 @@ impl FfxIndex {
             .partition_point(|entry| entry.last_id.as_str() < target)
     }
 
-    fn read_block(&mut self, block_index: usize) -> io::Result<Vec<FfxRecord>> {
-        if let Some(records) = self.cache.get(&block_index) {
-            return Ok(records.clone());
-        }
-        let entry = self.directory.get(block_index).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "Block index is out of bounds")
-        })?;
-        let stored_len = usize::try_from(entry.stored_len)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Block is too large"))?;
-        self.file.seek(SeekFrom::Start(entry.block_offset))?;
-        let mut stored = vec![0_u8; stored_len];
-        self.file.read_exact(&mut stored)?;
-        let records = decode_block(&stored, entry)?;
+    fn read_block(&mut self, block_index: usize) -> io::Result<&[FfxRecord]> {
+        if !self.cache.contains_key(&block_index) {
+            let entry = self.directory.get(block_index).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "Block index is out of bounds")
+            })?;
+            let stored_len = usize::try_from(entry.stored_len)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Block is too large"))?;
+            self.file.seek(SeekFrom::Start(entry.block_offset))?;
+            let mut stored = vec![0_u8; stored_len];
+            self.file.read_exact(&mut stored)?;
+            let records = decode_block(&stored, entry)?;
 
-        if self.cache.len() == CACHE_BLOCKS
-            && let Some(expired) = self.cache_order.pop_front()
-        {
-            self.cache.remove(&expired);
+            if self.cache.len() == CACHE_BLOCKS
+                && let Some(expired) = self.cache_order.pop_front()
+            {
+                self.cache.remove(&expired);
+            }
+            self.cache.insert(block_index, records);
+            self.cache_order.push_back(block_index);
         }
-        self.cache.insert(block_index, records.clone());
-        self.cache_order.push_back(block_index);
-        Ok(records)
+        Ok(self
+            .cache
+            .get(&block_index)
+            .expect("cached block is missing"))
     }
 }
 
