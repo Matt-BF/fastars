@@ -9,7 +9,7 @@ use crate::ffx::{FfxIndex, FfxRecord};
 use crate::indexer::{
     DEFAULT_SORT_MEMORY_MIB, build_index_from_fai_gzi, build_index_from_fasta, default_threads,
 };
-use regex::Regex;
+use regex::RegexBuilder;
 use std::collections::HashSet;
 use std::env;
 use std::error::Error;
@@ -21,6 +21,7 @@ use std::path::Path;
 enum IdMode {
     Exact,
     Prefix,
+    Partial,
 }
 
 struct FetchArgs {
@@ -30,6 +31,7 @@ struct FetchArgs {
     sort_by_offset: bool,
     verbose_missing: bool,
     id_mode: IdMode,
+    ignore_case: bool,
     id_regexp: Option<String>,
     invert_match: bool,
     temp_directory: Option<String>,
@@ -59,18 +61,19 @@ USAGE:
     fastars index --fai <FASTA.bgz.fai> --gzi <FASTA.bgz.gzi> [OPTIONS]
 
 COMMANDS:
-    fetch    Fetch FASTA records by exact ID, prefix, or regular expression.
+    fetch    Fetch FASTA records by exact ID, prefix, partial text, or regular expression.
     index    Build a compressed, self-contained .ffx index.
 
 FETCH OPTIONS:
     --fasta <FILE>             BGZF-compressed or plain FASTA. Required.
     --ffx <FILE>               Self-contained index. Default: <FASTA>.ffx
     -f, --ids-file <FILE>      Read one query ID per line.
-    -m, --id-mode <MODE>       Query mode for IDs: exact or prefix. Default: exact
+    -m, --id-mode <MODE>       Query mode: exact, prefix, or partial. Default: exact
+    -i, --ignore-case          ASCII case-insensitive ID and regex matching.
     -r, --id-regexp <REGEX>    Select indexed full IDs matching this regex.
     -v, --invert-match         With --id-regexp, select IDs that do not match.
     -s, --sort-by-offset       Fetch in FASTA order instead of request/index order.
-    --verbose-missing          Print every exact/prefix query with no matches.
+    --verbose-missing          Print every ID query with no matches.
     --temp-directory <DIR>     Directory for temporary files if auto-indexing.
     --sort-memory <MiB>        Auto-index sort memory budget. Default: 512
     --threads <N>              Auto-index worker threads. Default: available CPUs
@@ -90,8 +93,8 @@ INDEX OPTIONS:
 
 The .ffx stores full IDs, FASTA offsets, sequence lengths, and line layout.
 Fetching needs only the FASTA and .ffx; .fai/.gzi files are not
-read during fetch. Use --id-mode prefix for prefix queries or --id-regexp for
-regular-expression queries.
+read during fetch. Use --id-mode prefix for prefix queries, --id-mode partial
+for literal substring queries, or --id-regexp for regular-expression queries.
 "#
 }
 
@@ -137,8 +140,9 @@ fn parse_id_mode(value: &str) -> Result<IdMode, String> {
     match value {
         "exact" => Ok(IdMode::Exact),
         "prefix" => Ok(IdMode::Prefix),
+        "partial" => Ok(IdMode::Partial),
         _ => Err(format!(
-            "Invalid --id-mode value: {value}. Expected exact or prefix"
+            "Invalid --id-mode value: {value}. Expected exact, prefix, or partial"
         )),
     }
 }
@@ -150,6 +154,7 @@ fn parse_fetch_args() -> Result<FetchArgs, String> {
     let mut sort_by_offset = false;
     let mut verbose_missing = false;
     let mut id_mode = IdMode::Exact;
+    let mut ignore_case = false;
     let mut id_regexp = None;
     let mut invert_match = false;
     let mut temp_directory = None;
@@ -170,6 +175,7 @@ fn parse_fetch_args() -> Result<FetchArgs, String> {
                     .ok_or_else(|| "--id-mode needs a value".to_string())?;
                 id_mode = parse_id_mode(&value)?;
             }
+            "-i" | "--ignore-case" => ignore_case = true,
             "-r" | "--id-regexp" => id_regexp = arguments.next(),
             "-v" | "--invert-match" => invert_match = true,
             "-s" | "--sort-by-offset" => sort_by_offset = true,
@@ -218,6 +224,7 @@ fn parse_fetch_args() -> Result<FetchArgs, String> {
         sort_by_offset,
         verbose_missing,
         id_mode,
+        ignore_case,
         id_regexp,
         invert_match,
         temp_directory,
@@ -301,14 +308,14 @@ fn read_query_ids(arguments: &FetchArgs) -> io::Result<Vec<String>> {
     let mut ids = arguments
         .ids
         .iter()
-        .map(|value| normalize_id(value))
+        .map(|value| normalize_query(value, arguments.id_mode))
         .filter(|value| !value.is_empty())
         .collect::<Vec<_>>();
 
     if let Some(path) = &arguments.ids_file {
         let reader = BufReader::new(File::open(path)?);
         for line in reader.lines() {
-            let id = normalize_id(&line?);
+            let id = normalize_query(&line?, arguments.id_mode);
             if !id.is_empty() {
                 ids.push(id);
             }
@@ -316,6 +323,14 @@ fn read_query_ids(arguments: &FetchArgs) -> io::Result<Vec<String>> {
     }
 
     Ok(ids)
+}
+
+fn normalize_query(value: &str, mode: IdMode) -> String {
+    let value = normalize_id(value);
+    match mode {
+        IdMode::Exact | IdMode::Prefix => value,
+        IdMode::Partial => value.trim().to_string(),
+    }
 }
 
 fn add_records(records: Vec<FfxRecord>, seen: &mut HashSet<u64>, output: &mut Vec<FfxRecord>) {
@@ -418,11 +433,36 @@ fn run_fetch_command() -> Result<(), Box<dyn Error>> {
     let mut seen = HashSet::new();
     let mut missing = Vec::new();
 
-    for id in query_ids {
-        let matches = match arguments.id_mode {
-            IdMode::Exact => index.find_exact(&id)?,
-            IdMode::Prefix => index.find_prefix(&id)?,
-        };
+    let query_matches = match (arguments.id_mode, arguments.ignore_case) {
+        (IdMode::Exact, false) => query_ids
+            .iter()
+            .map(|query| index.find_exact(query))
+            .collect::<io::Result<Vec<_>>>()?,
+        (IdMode::Prefix, false) => query_ids
+            .iter()
+            .map(|query| index.find_prefix(query))
+            .collect::<io::Result<Vec<_>>>()?,
+        (IdMode::Partial, ignore_case) => index.find_partial_many(&query_ids, ignore_case)?,
+        (IdMode::Exact, true) => index.find_scan_many(&query_ids, |record, query| {
+            if query.bytes().any(|byte| byte.is_ascii_whitespace()) {
+                record.header.eq_ignore_ascii_case(query)
+            } else {
+                record.full_id.eq_ignore_ascii_case(query)
+            }
+        })?,
+        (IdMode::Prefix, true) => index.find_scan_many(&query_ids, |record, query| {
+            let candidate = if query.bytes().any(|byte| byte.is_ascii_whitespace()) {
+                &record.header
+            } else {
+                &record.full_id
+            };
+            candidate
+                .get(..query.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(query))
+        })?,
+    };
+
+    for (id, matches) in query_ids.into_iter().zip(query_matches) {
         if matches.is_empty() {
             missing.push(id);
         } else {
@@ -439,7 +479,15 @@ fn run_fetch_command() -> Result<(), Box<dyn Error>> {
         }
     }
 
-    let regex = arguments.id_regexp.as_deref().map(Regex::new).transpose()?;
+    let regex = arguments
+        .id_regexp
+        .as_deref()
+        .map(|pattern| {
+            RegexBuilder::new(pattern)
+                .case_insensitive(arguments.ignore_case)
+                .build()
+        })
+        .transpose()?;
     if arguments.sort_by_offset {
         if let Some(regex) = &regex {
             let matches = index.find_regex(regex, arguments.invert_match)?;
@@ -504,5 +552,9 @@ mod tests {
         assert_eq!(normalize_id("seq1 description"), "seq1 description");
         assert_eq!(normalize_id(">seq1 description\n"), "seq1 description");
         assert_eq!(normalize_id("  seq1  "), "seq1");
+        assert_eq!(
+            normalize_query("  >description with spaces  ", IdMode::Partial),
+            "description with spaces"
+        );
     }
 }
