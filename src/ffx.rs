@@ -2,6 +2,7 @@ mod block;
 mod format;
 mod writer;
 
+use aho_corasick::AhoCorasickBuilder;
 pub(crate) use block::IndexRecord;
 use block::decode_block;
 pub(crate) use format::read_u64;
@@ -64,10 +65,10 @@ impl FfxIndex {
         while block_index < self.directory.len() {
             let records = self.read_block(block_index)?;
             let start = records.partition_point(|record| record.full_id.as_str() < id);
-            for record in records.into_iter().skip(start) {
+            for record in records.iter().skip(start) {
                 match record.full_id.as_str().cmp(id) {
                     Ordering::Less => continue,
-                    Ordering::Equal => matches.push(record),
+                    Ordering::Equal => matches.push(record.clone()),
                     Ordering::Greater => return Ok(matches),
                 }
             }
@@ -89,9 +90,9 @@ impl FfxIndex {
         while block_index < self.directory.len() {
             let records = self.read_block(block_index)?;
             let start = records.partition_point(|record| record.full_id.as_str() < id_prefix);
-            for record in records.into_iter().skip(start) {
+            for record in records.iter().skip(start) {
                 if record.full_id.starts_with(id_prefix) {
-                    matches.push(record);
+                    matches.push(record.clone());
                 } else {
                     return Ok(matches);
                 }
@@ -117,11 +118,82 @@ impl FfxIndex {
         for block_index in 0..self.directory.len() {
             for record in self.read_block(block_index)? {
                 if regex.is_match(&record.header) != invert {
-                    visit(record)?;
+                    visit(record.clone())?;
                 }
             }
         }
         Ok(())
+    }
+
+    pub fn find_scan_many<F>(
+        &mut self,
+        queries: &[String],
+        mut predicate: F,
+    ) -> io::Result<Vec<Vec<FfxRecord>>>
+    where
+        F: FnMut(&FfxRecord, &str) -> bool,
+    {
+        let mut matches = vec![Vec::new(); queries.len()];
+        for block_index in 0..self.directory.len() {
+            for record in self.read_block(block_index)? {
+                for (query_index, query) in queries.iter().enumerate() {
+                    if predicate(record, query) {
+                        matches[query_index].push(record.clone());
+                    }
+                }
+            }
+        }
+        Ok(matches)
+    }
+
+    pub fn find_partial_many(
+        &mut self,
+        queries: &[String],
+        ignore_case: bool,
+    ) -> io::Result<Vec<Vec<FfxRecord>>> {
+        let mut pattern_indexes = HashMap::new();
+        let mut patterns = Vec::new();
+        let mut pattern_queries: Vec<Vec<usize>> = Vec::new();
+        for (query_index, query) in queries.iter().enumerate() {
+            let pattern_index = if let Some(index) = pattern_indexes.get(query.as_str()) {
+                *index
+            } else {
+                let index = patterns.len();
+                patterns.push(query.as_str());
+                pattern_queries.push(Vec::new());
+                pattern_indexes.insert(query.as_str(), index);
+                index
+            };
+            pattern_queries[pattern_index].push(query_index);
+        }
+
+        let matcher = AhoCorasickBuilder::new()
+            .ascii_case_insensitive(ignore_case)
+            .build(patterns)
+            .map_err(io::Error::other)?;
+        let mut matches = vec![Vec::new(); queries.len()];
+        let mut pattern_stamps = vec![0_usize; pattern_queries.len()];
+        let mut record_stamp = 0_usize;
+        for block_index in 0..self.directory.len() {
+            for record in self.read_block(block_index)? {
+                if record_stamp == usize::MAX {
+                    pattern_stamps.fill(0);
+                    record_stamp = 0;
+                }
+                record_stamp += 1;
+                for matched in matcher.find_overlapping_iter(&record.header) {
+                    let pattern_index = matched.pattern().as_usize();
+                    if pattern_stamps[pattern_index] == record_stamp {
+                        continue;
+                    }
+                    pattern_stamps[pattern_index] = record_stamp;
+                    for query_index in &pattern_queries[pattern_index] {
+                        matches[*query_index].push(record.clone());
+                    }
+                }
+            }
+        }
+        Ok(matches)
     }
 
     fn lower_bound_block(&self, target: &str) -> usize {
@@ -129,28 +201,30 @@ impl FfxIndex {
             .partition_point(|entry| entry.last_id.as_str() < target)
     }
 
-    fn read_block(&mut self, block_index: usize) -> io::Result<Vec<FfxRecord>> {
-        if let Some(records) = self.cache.get(&block_index) {
-            return Ok(records.clone());
-        }
-        let entry = self.directory.get(block_index).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "Block index is out of bounds")
-        })?;
-        let stored_len = usize::try_from(entry.stored_len)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Block is too large"))?;
-        self.file.seek(SeekFrom::Start(entry.block_offset))?;
-        let mut stored = vec![0_u8; stored_len];
-        self.file.read_exact(&mut stored)?;
-        let records = decode_block(&stored, entry)?;
+    fn read_block(&mut self, block_index: usize) -> io::Result<&[FfxRecord]> {
+        if !self.cache.contains_key(&block_index) {
+            let entry = self.directory.get(block_index).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "Block index is out of bounds")
+            })?;
+            let stored_len = usize::try_from(entry.stored_len)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Block is too large"))?;
+            self.file.seek(SeekFrom::Start(entry.block_offset))?;
+            let mut stored = vec![0_u8; stored_len];
+            self.file.read_exact(&mut stored)?;
+            let records = decode_block(&stored, entry)?;
 
-        if self.cache.len() == CACHE_BLOCKS
-            && let Some(expired) = self.cache_order.pop_front()
-        {
-            self.cache.remove(&expired);
+            if self.cache.len() == CACHE_BLOCKS
+                && let Some(expired) = self.cache_order.pop_front()
+            {
+                self.cache.remove(&expired);
+            }
+            self.cache.insert(block_index, records);
+            self.cache_order.push_back(block_index);
         }
-        self.cache.insert(block_index, records.clone());
-        self.cache_order.push_back(block_index);
-        Ok(records)
+        Ok(self
+            .cache
+            .get(&block_index)
+            .expect("cached block is missing"))
     }
 }
 
@@ -230,6 +304,24 @@ mod tests {
         assert_eq!(index.find_regex(&regex, true).unwrap().len(), 5);
         let description = Regex::new("second description$").unwrap();
         assert_eq!(index.find_regex(&description, false).unwrap().len(), 1);
+        let partial_queries = vec![
+            "second description".to_string(),
+            "PREFIX-".to_string(),
+            "second description".to_string(),
+            "i".to_string(),
+        ];
+        let partial = index.find_partial_many(&partial_queries, true).unwrap();
+        assert_eq!(partial[0].len(), 1);
+        assert_eq!(partial[1].len(), 2);
+        assert_eq!(partial[2], partial[0]);
+        assert_eq!(partial[3].len(), 5);
+        let exact_queries = vec!["DUPLICATE SECOND DESCRIPTION".to_string()];
+        let exact = index
+            .find_scan_many(&exact_queries, |record, query| {
+                record.header.eq_ignore_ascii_case(query)
+            })
+            .unwrap();
+        assert_eq!(exact[0].len(), 1);
         fs::remove_file(output).unwrap();
     }
 

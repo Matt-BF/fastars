@@ -6,6 +6,22 @@ to standard output, so it fits directly into shell pipelines.
 
 Use `fastars index` to build an index and `fastars fetch` to retrieve records.
 
+## Generate a test FASTA
+
+Create a deterministic BGZF FASTA for benchmarks and feature checks:
+
+```bash
+fastars generate \
+  --output benchmark.fna.bgz \
+  --number-seqs 100000 \
+  --number-bases 1000
+```
+
+`--ns` and `--nbp` are aliases for `--number-seqs` and `--number-bases`.
+Records are named `seqid_1` through `seqid_N`, and their sequences contain
+deterministic pseudo-random `A`, `C`, `G`, and `T` bases. Index the result with
+`fastars index --fasta benchmark.fna.bgz`.
+
 ## Requirements if building from source
 
 - Rust and Cargo to build the program.
@@ -69,9 +85,9 @@ and FASTA line layout in independently compressed blocks for fast lookup
 without loading the complete index. Building from `.fai/.gzi` cannot preserve
 header descriptions because `.fai` contains only primary IDs.
 
-After building the index, use `--id-mode prefix` to fetch IDs by literal prefix
-or `--id-regexp` to select indexed IDs with a regular expression. Examples for
-both modes are below.
+After building the index, use `--id-mode prefix` to fetch IDs by literal
+prefix, `--id-mode partial` for fixed substring matching, or `--id-regexp` to
+select indexed headers with a regular expression.
 
 ## Fetch by exact ID or header
 
@@ -123,6 +139,19 @@ the query `IMGVR_UViG_2582581227_000001` matches because it is a literal prefix.
 For the descriptive `ABC123` example above, the prefix
 `ABC123 hypothetical` also matches.
 
+## Fetch by partial fixed substring
+
+Partial mode finds a literal string anywhere in the complete FASTA header,
+including its description:
+
+```bash
+fastars fetch --fasta sequences.fna.bgz \
+  --id-mode partial 'hypothetical protein' > selected.fna
+```
+
+Unlike `--id-regexp`, partial queries are not interpreted as regular
+expressions. Multiple queries are matched together in a single index scan.
+
 ## Fetch from an ID file
 
 Use `-f` or `--ids-file` for one query per line:
@@ -134,8 +163,18 @@ fastars fetch --fasta sequences.fna.bgz \
 ```
 
 With `--id-mode exact`, each line may be a primary ID or complete header. With
-`--id-mode prefix`, each line is treated as a literal prefix of an ID or header.
-`-m` is the short form of `--id-mode`.
+`--id-mode prefix`, each line is a literal prefix of an ID or header. With
+`--id-mode partial`, each line is a literal substring and may contain
+whitespace. `-m` is the short form of `--id-mode`.
+
+Add `-i` or `--ignore-case` to make exact, prefix, partial, and regex matching
+ASCII case-insensitive. Case-insensitive exact and prefix queries scan the
+index; case-sensitive exact and prefix queries use the sorted-ID lookup.
+
+For explicit query results spread across the FASTA, use `--fetch-threads <N>`
+(`N` from 1 through 16) to fetch bounded batches in parallel while preserving
+output order. Regex-only results remain sequential so they can stream without
+buffering the full result set.
 
 ## Search complete headers with regex
 
@@ -158,15 +197,19 @@ fastars fetch --fasta sequences.fna.bgz \
 `-v` and `--invert-match` are equivalent.
 `-r` is the short form of `--id-regexp`.
 
+Regular expressions use [Rust's `regex` syntax](https://docs.rs/regex/latest/regex/),
+which does not support look-around or backreferences. Use `--id-mode partial`
+when the query should be treated as a fixed string.
+
 Regex mode is useful for broad metadata-style searches. For large ID lists,
 prefer exact or prefix lookup with `-f` because it uses binary search over the
 sorted ID index.
 
 ## Output order
 
-By default, exact and prefix results follow query order, and regex results
-follow sorted ID order. Use `--sort-by-offset` to fetch in FASTA order, which
-can reduce random disk access for many records. `-s` is its short form:
+By default, exact, prefix, and partial results follow query order, and regex
+results follow sorted ID order. Use `--sort-by-offset` to fetch in FASTA order,
+which can reduce random disk access for many records. `-s` is its short form:
 
 ```bash
 fastars fetch --fasta sequences.fna.bgz \
