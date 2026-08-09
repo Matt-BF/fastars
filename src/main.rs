@@ -17,6 +17,8 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
 
+const MAX_FETCH_THREADS: usize = 16;
+
 #[derive(Clone, Copy)]
 enum IdMode {
     Exact,
@@ -36,6 +38,7 @@ struct FetchArgs {
     sort_memory_bytes: usize,
     threads: usize,
     show_progress: bool,
+    fetch_threads: usize,
     ids: Vec<String>,
 }
 
@@ -75,6 +78,7 @@ FETCH OPTIONS:
     --sort-memory <MiB>        Auto-index sort memory budget. Default: 512
     --threads <N>              Auto-index worker threads. Default: available CPUs
     --no-progress              Disable indexing progress on stderr.
+    --fetch-threads <N>        Fetch explicit query results with up to 16 workers.
     -h, --help                 Print this help message.
 
 INDEX OPTIONS:
@@ -156,6 +160,7 @@ fn parse_fetch_args() -> Result<FetchArgs, String> {
     let mut sort_memory_mib = DEFAULT_SORT_MEMORY_MIB;
     let mut threads = default_threads();
     let mut show_progress = true;
+    let mut fetch_threads = 1;
     let mut ids = Vec::new();
     let mut arguments = env::args().skip(2);
 
@@ -198,6 +203,18 @@ fn parse_fetch_args() -> Result<FetchArgs, String> {
                 }
             }
             "--no-progress" => show_progress = false,
+            "--fetch-threads" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "--fetch-threads needs a value".to_string())?;
+                fetch_threads = value
+                    .parse()
+                    .ok()
+                    .filter(|value: &usize| (1..=MAX_FETCH_THREADS).contains(value))
+                    .ok_or_else(|| {
+                        format!("--fetch-threads must be an integer from 1 to {MAX_FETCH_THREADS}")
+                    })?;
+            }
             "--full-id" => id_mode = IdMode::Exact,
             "-h" | "--help" => return Err(usage().to_string()),
             _ if argument.starts_with('-') => {
@@ -224,6 +241,7 @@ fn parse_fetch_args() -> Result<FetchArgs, String> {
         sort_memory_bytes,
         threads,
         show_progress,
+        fetch_threads,
         ids,
     })
 }
@@ -326,9 +344,9 @@ fn add_records(records: Vec<FfxRecord>, seen: &mut HashSet<u64>, output: &mut Ve
     }
 }
 
-fn write_record(
+fn write_record<W: Write>(
     reader: &mut FastaReader,
-    output: &mut BufWriter<io::StdoutLock<'_>>,
+    output: &mut W,
     record: &FfxRecord,
 ) -> io::Result<()> {
     reader.seek(record.virtual_offset)?;
@@ -338,6 +356,73 @@ fn write_record(
     for line in sequence.chunks(60) {
         output.write_all(line)?;
         output.write_all(b"\n")?;
+    }
+    Ok(())
+}
+
+fn record_bytes(reader: &mut FastaReader, record: &FfxRecord) -> io::Result<Vec<u8>> {
+    let sequence_len = usize::try_from(record.sequence_length).unwrap_or(0);
+    let mut output = Vec::with_capacity(
+        record
+            .header
+            .len()
+            .saturating_add(sequence_len)
+            .saturating_add(sequence_len.div_ceil(60))
+            .saturating_add(2),
+    );
+    write_record(reader, &mut output, record)?;
+    Ok(output)
+}
+
+fn write_records<W: Write>(
+    fasta_path: &str,
+    output: &mut W,
+    records: &[FfxRecord],
+    fetch_threads: usize,
+) -> io::Result<()> {
+    if fetch_threads == 1 || records.len() < 2 {
+        let mut reader = FastaReader::new(fasta_path)?;
+        for record in records {
+            write_record(&mut reader, output, record)?;
+        }
+        return Ok(());
+    }
+
+    let batch_size = fetch_threads.saturating_mul(2);
+    for batch in records.chunks(batch_size) {
+        let worker_count = fetch_threads.min(batch.len());
+        let fetched = std::thread::scope(|scope| -> io::Result<Vec<(usize, Vec<u8>)>> {
+            let mut workers = Vec::with_capacity(worker_count);
+            for worker_index in 0..worker_count {
+                workers.push(scope.spawn(move || -> io::Result<Vec<(usize, Vec<u8>)>> {
+                    let mut reader = FastaReader::new(fasta_path)?;
+                    batch
+                        .iter()
+                        .enumerate()
+                        .skip(worker_index)
+                        .step_by(worker_count)
+                        .map(|(record_index, record)| {
+                            record_bytes(&mut reader, record).map(|bytes| (record_index, bytes))
+                        })
+                        .collect()
+                }));
+            }
+
+            let mut fetched = Vec::with_capacity(batch.len());
+            for worker in workers {
+                fetched.extend(
+                    worker
+                        .join()
+                        .map_err(|_| io::Error::other("FASTA fetch worker panicked"))??,
+                );
+            }
+            Ok(fetched)
+        })?;
+        let mut fetched = fetched;
+        fetched.sort_unstable_by_key(|(record_index, _)| *record_index);
+        for (_, bytes) in fetched {
+            output.write_all(&bytes)?;
+        }
     }
     Ok(())
 }
@@ -448,16 +533,19 @@ fn run_fetch_command() -> Result<(), Box<dyn Error>> {
         records.sort_by_key(|record| record.virtual_offset);
     }
 
-    let mut reader = FastaReader::new(&arguments.fasta)?;
     let stdout = io::stdout();
     let mut output = BufWriter::new(stdout.lock());
-    for record in &records {
-        write_record(&mut reader, &mut output, record)?;
-    }
+    write_records(
+        &arguments.fasta,
+        &mut output,
+        &records,
+        arguments.fetch_threads,
+    )?;
 
     if !arguments.sort_by_offset
         && let Some(regex) = &regex
     {
+        let mut reader = FastaReader::new(&arguments.fasta)?;
         index.for_each_regex(regex, arguments.invert_match, |record| {
             if seen.insert(record.record_id) {
                 write_record(&mut reader, &mut output, &record)?;
@@ -498,11 +586,49 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_PATH: AtomicU64 = AtomicU64::new(0);
+
+    fn test_path(suffix: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "fastars-fetch-{}-{}-{suffix}",
+            std::process::id(),
+            NEXT_PATH.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
 
     #[test]
     fn query_normalization_preserves_complete_headers() {
         assert_eq!(normalize_id("seq1 description"), "seq1 description");
         assert_eq!(normalize_id(">seq1 description\n"), "seq1 description");
         assert_eq!(normalize_id("  seq1  "), "seq1");
+    }
+
+    #[test]
+    fn parallel_fetch_preserves_requested_order() {
+        let fasta = test_path("parallel.fna");
+        fs::write(&fasta, b">seq1\nAAAA\n>seq2\nCCCC\n>seq3\nGGGG\n").unwrap();
+        let record = |id: &str, offset| FfxRecord {
+            record_id: offset,
+            full_id: id.to_string(),
+            header: id.to_string(),
+            virtual_offset: offset,
+            sequence_length: 4,
+            line_bases: 4,
+            line_width: 5,
+        };
+        let records = [record("seq3", 28), record("seq1", 6), record("seq2", 17)];
+
+        let mut sequential = Vec::new();
+        write_records(fasta.to_str().unwrap(), &mut sequential, &records, 1).unwrap();
+        let mut parallel = Vec::new();
+        write_records(fasta.to_str().unwrap(), &mut parallel, &records, 3).unwrap();
+
+        assert_eq!(parallel, sequential);
+        assert_eq!(parallel, b">seq3\nGGGG\n>seq1\nAAAA\n>seq2\nCCCC\n");
+        fs::remove_file(fasta).unwrap();
     }
 }

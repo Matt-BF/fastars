@@ -137,6 +137,11 @@ With `--id-mode exact`, each line may be a primary ID or complete header. With
 `--id-mode prefix`, each line is treated as a literal prefix of an ID or header.
 `-m` is the short form of `--id-mode`.
 
+For explicit query results spread across the FASTA, use `--fetch-threads <N>`
+(`N` from 1 through 16) to fetch bounded batches in parallel while preserving
+output order. Regex-only results remain sequential so they can stream without
+buffering the full result set.
+
 ## Search complete headers with regex
 
 `--id-regexp` scans complete indexed headers, including descriptions, but not
