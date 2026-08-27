@@ -18,6 +18,7 @@ use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
 
 const MAX_FETCH_THREADS: usize = 16;
+const QUERY_BATCH_SIZE: usize = 65_536;
 
 #[derive(Clone, Copy)]
 enum IdMode {
@@ -72,7 +73,7 @@ FETCH OPTIONS:
     -m, --id-mode <MODE>       Query mode for IDs: exact or prefix. Default: exact
     -r, --id-regexp <REGEX>    Select indexed full IDs matching this regex.
     -v, --invert-match         With --id-regexp, select IDs that do not match.
-    -s, --sort-by-offset       Fetch in FASTA order instead of request/index order.
+    -s, --sort-by-offset       Fetch in FASTA order; buffers all matches first.
     --verbose-missing          Print every exact/prefix query with no matches.
     --temp-directory <DIR>     Directory for temporary files if auto-indexing.
     --sort-memory <MiB>        Auto-index sort memory budget. Default: 512
@@ -344,6 +345,17 @@ fn add_records(records: Vec<FfxRecord>, seen: &mut HashSet<u64>, output: &mut Ve
     }
 }
 
+fn find_query_batch(
+    index: &mut FfxIndex,
+    id_mode: IdMode,
+    query_ids: &[String],
+) -> io::Result<Vec<Vec<FfxRecord>>> {
+    match id_mode {
+        IdMode::Exact => query_ids.iter().map(|id| index.find_exact(id)).collect(),
+        IdMode::Prefix => index.find_prefix_batch(query_ids),
+    }
+}
+
 fn write_record<W: Write>(
     reader: &mut FastaReader,
     output: &mut W,
@@ -501,27 +513,47 @@ fn run_fetch_command() -> Result<(), Box<dyn Error>> {
     let mut index = FfxIndex::open(&arguments.ffx)?;
     let mut records = Vec::new();
     let mut seen = HashSet::new();
-    let mut missing = Vec::new();
+    let mut missing_count = 0;
+    let stdout = io::stdout();
+    let mut output = BufWriter::new(stdout.lock());
+    let query_batch_size = if arguments.sort_by_offset {
+        query_ids.len().max(1)
+    } else {
+        QUERY_BATCH_SIZE
+    };
 
-    for id in query_ids {
-        let matches = match arguments.id_mode {
-            IdMode::Exact => index.find_exact(&id)?,
-            IdMode::Prefix => index.find_prefix(&id)?,
-        };
-        if matches.is_empty() {
-            missing.push(id);
+    for query_batch in query_ids.chunks(query_batch_size) {
+        let batch_matches = find_query_batch(&mut index, arguments.id_mode, query_batch)?;
+        let mut batch_records = Vec::new();
+        let target = if arguments.sort_by_offset {
+            &mut records
         } else {
-            add_records(matches, &mut seen, &mut records);
+            &mut batch_records
+        };
+
+        for (id, matches) in query_batch.iter().zip(batch_matches) {
+            if matches.is_empty() {
+                missing_count += 1;
+                if arguments.verbose_missing {
+                    eprintln!("[WARN] ID not found: {id}");
+                }
+            } else {
+                add_records(matches, &mut seen, target);
+            }
+        }
+
+        if !arguments.sort_by_offset {
+            write_records(
+                &arguments.fasta,
+                &mut output,
+                &batch_records,
+                arguments.fetch_threads,
+            )?;
         }
     }
 
-    if !missing.is_empty() {
-        eprintln!("[WARN] {} ID queries had no matches", missing.len());
-        if arguments.verbose_missing {
-            for id in missing {
-                eprintln!("[WARN] ID not found: {id}");
-            }
-        }
+    if missing_count != 0 {
+        eprintln!("[WARN] {missing_count} ID queries had no matches");
     }
 
     let regex = arguments.id_regexp.as_deref().map(Regex::new).transpose()?;
@@ -533,14 +565,14 @@ fn run_fetch_command() -> Result<(), Box<dyn Error>> {
         records.sort_by_key(|record| record.virtual_offset);
     }
 
-    let stdout = io::stdout();
-    let mut output = BufWriter::new(stdout.lock());
-    write_records(
-        &arguments.fasta,
-        &mut output,
-        &records,
-        arguments.fetch_threads,
-    )?;
+    if arguments.sort_by_offset {
+        write_records(
+            &arguments.fasta,
+            &mut output,
+            &records,
+            arguments.fetch_threads,
+        )?;
+    }
 
     if !arguments.sort_by_offset
         && let Some(regex) = &regex

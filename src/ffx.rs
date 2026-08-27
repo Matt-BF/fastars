@@ -101,6 +101,22 @@ impl FfxIndex {
         Ok(matches)
     }
 
+    /// Resolve prefixes in index order while returning matches in request order.
+    pub fn find_prefix_batch(&mut self, prefixes: &[String]) -> io::Result<Vec<Vec<FfxRecord>>> {
+        let mut query_order = (0..prefixes.len()).collect::<Vec<_>>();
+        query_order.sort_unstable_by(|left, right| {
+            primary_id(&prefixes[*left])
+                .cmp(primary_id(&prefixes[*right]))
+                .then_with(|| prefixes[*left].cmp(&prefixes[*right]))
+        });
+
+        let mut matches = vec![Vec::new(); prefixes.len()];
+        for query_index in query_order {
+            matches[query_index] = self.find_prefix(&prefixes[query_index])?;
+        }
+        Ok(matches)
+    }
+
     pub fn find_regex(&mut self, regex: &Regex, invert: bool) -> io::Result<Vec<FfxRecord>> {
         let mut records = Vec::new();
         self.for_each_regex(regex, invert, |record| {
@@ -226,6 +242,18 @@ mod tests {
             index.find_prefix("duplicate first").unwrap()[0].header,
             "duplicate first description"
         );
+        let batch = index
+            .find_prefix_batch(&[
+                "prefix-2".into(),
+                "a".into(),
+                "missing".into(),
+                "prefix-".into(),
+            ])
+            .unwrap();
+        assert_eq!(batch[0][0].full_id, "prefix-2");
+        assert_eq!(batch[1][0].full_id, "a");
+        assert!(batch[2].is_empty());
+        assert_eq!(batch[3].len(), 2);
         assert!(index.find_exact("missing").unwrap().is_empty());
         let regex = Regex::new("^(a|z)$").unwrap();
         assert_eq!(index.find_regex(&regex, false).unwrap().len(), 2);

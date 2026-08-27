@@ -13,9 +13,6 @@ Use `fastars index` to build an index and `fastars fetch` to retrieve records.
 - A BGZF-compressed (`.bgz`) or uncompressed FASTA. Plain gzip and zstd
   compression are not supported.
 
-Fetch does not require `.fai` or `.gzi` files. Those files are only optional
-inputs for building `.ffx` faster when they already exist.
-
 ## Build
 
 ```bash
@@ -139,8 +136,9 @@ With `--id-mode exact`, each line may be a primary ID or complete header. With
 
 For explicit query results spread across the FASTA, use `--fetch-threads <N>`
 (`N` from 1 through 16) to fetch bounded batches in parallel while preserving
-output order. Regex-only results remain sequential so they can stream without
-buffering the full result set.
+output order. Large prefix lists are resolved in ID-sorted batches, and each
+batch is fetched as soon as its lookups finish. Regex-only results remain
+sequential so they can stream without buffering the full result set.
 
 ## Search complete headers with regex
 
@@ -171,7 +169,9 @@ sorted ID index.
 
 By default, exact and prefix results follow query order, and regex results
 follow sorted ID order. Use `--sort-by-offset` to fetch in FASTA order, which
-can reduce random disk access for many records. `-s` is its short form:
+can reduce random disk access for many records. Because this requires a global
+sort, `--sort-by-offset` buffers all matches before writing output instead of
+streaming query batches. `-s` is its short form:
 
 ```bash
 fastars fetch --fasta sequences.fna.bgz \
