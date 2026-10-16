@@ -30,18 +30,16 @@ Intel.
 
 ## Build an index
 
-The preferred path scans the BGZF-compressed or uncompressed FASTA directly:
+`fastars` scans BGZF-compressed or uncompressed FASTA:
 
 ```bash
 fastars index --fasta sequences.fna.bgz
 ```
 
-Set `--sort-memory <MiB>` to change the budget; larger indexes automatically
+Set `--sort-memory <MiB>` to change memory usage; larger indexes automatically
 fall back to a platform-independent external merge sort in `--temp-directory`.
 Up to 512 MiB is used for an in-memory ID sort by default.
-Temporary records are stored in compact binary runs, with each sort run bounded
-by the requested memory budget. BGZF decompression and block encoding use all
-available CPUs by default; use `--threads <N>` to set the worker count.
+Use `--threads <N>` to set the worker count.
 
 This writes:
 
@@ -49,7 +47,7 @@ This writes:
 sequences.fna.bgz.ffx
 ```
 
-If existing samtools indexes are available, they can be used as a build
+If existing `samtools` indexes are available, they can be used as a build
 accelerator but are not required and can be deleted after creating the `.ffx`
 file:
 
@@ -66,7 +64,7 @@ and FASTA line layout in independently compressed blocks for fast lookup
 without loading the complete index. Building from `.fai/.gzi` cannot preserve
 header descriptions because `.fai` contains only primary IDs.
 
-After building the index, use `--id-mode prefix` to fetch IDs by literal prefix
+After building the index, use `--id-mode prefix` (or the short form `-m`) to fetch IDs by literal prefix
 or `--id-regexp` to select indexed IDs with a regular expression. Examples for
 both modes are below.
 
@@ -132,7 +130,6 @@ fastars fetch --fasta sequences.fna.bgz \
 
 With `--id-mode exact`, each line may be a primary ID or complete header. With
 `--id-mode prefix`, each line is treated as a literal prefix of an ID or header.
-`-m` is the short form of `--id-mode`.
 
 For explicit query results spread across the FASTA, use `--fetch-threads <N>`
 (`N` from 1 through 16) to fetch bounded batches in parallel while preserving
@@ -170,8 +167,8 @@ sorted ID index.
 By default, exact and prefix results follow query order, and regex results
 follow sorted ID order. Use `--sort-by-offset` to fetch in FASTA order, which
 can reduce random disk access for many records. Because this requires a global
-sort, `--sort-by-offset` buffers all matches before writing output instead of
-streaming query batches. `-s` is its short form:
+sort, `--sort-by-offset` (or `-s`) buffers all matches before writing output instead of
+streaming query batches.
 
 ```bash
 fastars fetch --fasta sequences.fna.bgz \
@@ -179,6 +176,54 @@ fastars fetch --fasta sequences.fna.bgz \
   -f short_ids.txt \
   --sort-by-offset > selected.fna
 ```
+
+## Help output
+
+```sh
+fastars — fast random retrieval from BGZF-compressed or plain FASTA files
+
+USAGE:
+    fastars fetch --fasta <FASTA.bgz> [OPTIONS] [ID ...]
+    fastars index --fasta <FASTA.bgz> [OPTIONS]
+    fastars index --fai <FASTA.bgz.fai> --gzi <FASTA.bgz.gzi> [OPTIONS]
+
+COMMANDS:
+    fetch    Fetch FASTA records by exact ID, prefix, or regular expression.
+    index    Build a compressed, self-contained .ffx index.
+
+FETCH OPTIONS:
+    --fasta <FILE>             BGZF-compressed or plain FASTA. Required.
+    --ffx <FILE>               Self-contained index. Default: <FASTA>.ffx
+    -f, --ids-file <FILE>      Read one query ID per line.
+    -m, --id-mode <MODE>       Query mode for IDs: exact or prefix. Default: exact
+    -r, --id-regexp <REGEX>    Select indexed full IDs matching this regex.
+    -v, --invert-match         With --id-regexp, select IDs that do not match.
+    -s, --sort-by-offset       Fetch in FASTA order; buffers all matches first.
+    --verbose-missing          Print every exact/prefix query with no matches.
+    --temp-directory <DIR>     Directory for temporary files if auto-indexing.
+    --sort-memory <MiB>        Auto-index sort memory budget. Default: 512
+    --threads <N>              Auto-index worker threads. Default: available CPUs
+    --no-progress              Disable indexing progress on stderr.
+    --fetch-threads <N>        Fetch explicit query results with up to 16 workers.
+    -h, --help                 Print this help message.
+
+INDEX OPTIONS:
+    --fasta <FILE>             Build .ffx by scanning a BGZF or plain FASTA.
+    --fai <FILE>               Optional build source: existing FASTA .fai.
+    --gzi <FILE>               Required with --fai to convert offsets once.
+    --output <FILE>            Output index. Default: <FASTA>.ffx or <FAI>.ffx
+    --temp-directory <DIR>     Directory for external sort temporary files.
+    --sort-memory <MiB>        Memory budget before external sort. Default: 512
+    --threads <N>              Index worker threads. Default: available CPUs
+    --no-progress              Disable progress output on stderr.
+    -h, --help                 Print index-specific help.
+
+The .ffx stores full IDs, FASTA offsets, sequence lengths, and line layout.
+Fetching needs only the FASTA and .ffx; .fai/.gzi files are not
+read during fetch. Use --id-mode prefix for prefix queries or --id-regexp for
+regular-expression queries.
+```
+
 
 ## Notes
 
